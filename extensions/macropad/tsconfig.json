@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2022", "module": "NodeNext", "moduleResolution": "NodeNext",
+    "rootDir": "../..",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"], "strict": true, "skipLibCheck": true,
+    "noEmit": true, "noUncheckedIndexedAccess": true, "noUnusedLocals": true,
+    "noUnusedParameters": true, "experimentalDecorators": true, "useDefineForClassFields": false,
+    "types": ["node"], "allowImportingTsExtensions": true
+  },
+  "include": ["index.ts", "contract.ts", "src/**/*.ts", "browser/**/*.ts", "../../ui/src/**/*.d.ts", "../../src/**/*.d.ts"],
+  "exclude": ["**/*.test.ts", "**/test/**", "dist"]
+}

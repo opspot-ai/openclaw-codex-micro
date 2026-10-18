@@ -1,0 +1,24 @@
+{
+  "id": "macropad",
+  "name": "Codex Micro",
+  "description": "Use a Codex Micro to follow conversations and operate OpenClaw's native controls.",
+  "enabledByDefault": false,
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "controlUi": {
+    "entry": "dist/control-ui/3df2c42368f54df27e9b3dc1a6feae9ad3a2f307b82fe7f55d3dbbb0e91977f6/index.js",
+    "styles": [
+      "dist/control-ui/3df2c42368f54df27e9b3dc1a6feae9ad3a2f307b82fe7f55d3dbbb0e91977f6/index.css"
+    ]
+  },
+  "version": "0.1.0",
+  "contracts": {
+    "tools": []
+  }
+}

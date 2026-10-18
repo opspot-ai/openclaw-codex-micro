@@ -1,0 +1,4607 @@
+diff --git a/apps/macos/Sources/OpenClaw/DashboardWindowController.swift b/apps/macos/Sources/OpenClaw/DashboardWindowController.swift
+index b80965d0e67..7ef2303374b 100644
+--- a/apps/macos/Sources/OpenClaw/DashboardWindowController.swift
++++ b/apps/macos/Sources/OpenClaw/DashboardWindowController.swift
+@@ -154,6 +154,7 @@ final class DashboardWindowController: NSWindowController, WKNavigationDelegate,
+         let deviceSettingsMessageHandler = DashboardDeviceSettingsMessageHandler()
+         self.deviceSettingsMessageHandler = deviceSettingsMessageHandler
+         let browserMessageHandler = DashboardBrowserMessageHandler()
++        let windowFocusMessageHandler = DashboardWindowFocusMessageHandler()
+         let documentHost = ControlUIDocumentHost(
+             url: url,
+             auth: auth,
+@@ -177,6 +178,8 @@ final class DashboardWindowController: NSWindowController, WKNavigationDelegate,
+                 deviceSettingsMessageHandler, contentWorld: .page, name: Self.deviceSettingsMessageHandlerName)
+             controller.addScriptMessageHandler(
+                 browserMessageHandler, contentWorld: .page, name: DashboardBrowserMessageHandler.name)
++            controller.addScriptMessageHandler(
++                windowFocusMessageHandler, contentWorld: .page, name: DashboardWindowFocusMessageHandler.name)
+             if shouldEnableUpdateBridge {
+                 // Handler presence is the Control UI feature probe; unsigned builds
+                 // and remote dashboards must not advertise a local app update.
+@@ -230,6 +233,7 @@ final class DashboardWindowController: NSWindowController, WKNavigationDelegate,
+         appLinkMessageHandler.owner = self
+         deviceSettingsMessageHandler.owner = self
+         browserMessageHandler.owner = self
++        windowFocusMessageHandler.owner = self
+         deviceSettingsMessageHandler.startObserving()
+         self.webView.navigationDelegate = self
+         self.webView.uiDelegate = self
+@@ -984,6 +988,31 @@ extension DashboardWindowController {
+         self.refreshNativeCommandReadiness()
+     }
+ 
++    func receiveWindowFocusMessage(
++        _ message: WKScriptMessage,
++        replyHandler: @escaping @MainActor (Any?, String?) -> Void)
++    {
++        guard message.webView === self.webView, message.frameInfo.isMainFrame,
++              ControlUIDocumentHost.isTrustedLinkSource(message.frameInfo.request.url, dashboardURL: self.currentURL),
++              self.documentHost.hasLiveContent, self.documentHost.hasCurrentBrowserSession,
++              self.pendingGatewaySwitch == nil, !self.isShowingFailurePage, !self.webView.isLoading,
++              let body = message.body as? [String: Any], body.count == 1,
++              body["type"] as? String == "focus-window", let window
++        else {
++            replyHandler(nil, "The current trusted dashboard window is required.")
++            return
++        }
++        guard AppActivation.shared.allowsActivation else {
++            replyHandler(["focused": false], nil)
++            return
++        }
++        AppActivation.shared.deminiaturize(window: window)
++        AppActivation.shared.activate()
++        AppActivation.shared.makeKeyAndOrderFront(window: window)
++        window.makeFirstResponder(self.webView)
++        replyHandler(["focused": window.isKeyWindow && NSApp.isActive], nil)
++    }
++
+     private func refreshNativeCommandReadiness() {
+         guard self.auth.usesBrowserIdentity else { return }
+         let sourceID = self.notificationSourceID
+diff --git a/extensions/codex/src/app-server/client-runtime.test.ts b/extensions/codex/src/app-server/client-runtime.test.ts
+index 8f6a4dd3d53..8112521e560 100644
+--- a/extensions/codex/src/app-server/client-runtime.test.ts
++++ b/extensions/codex/src/app-server/client-runtime.test.ts
+@@ -104,9 +104,9 @@ describe("Codex app-server client runtime", () => {
+     ensureCodexAppServerClientRuntime(harness.client, context);
+     ensureCodexAppServerClientRuntime(harness.client, updatedContext);
+ 
+-    expect(addNotificationHandler).toHaveBeenCalledTimes(1);
++    expect(addNotificationHandler).toHaveBeenCalledTimes(2);
+     expect(addRequestHandler).toHaveBeenCalledTimes(1);
+-    expect(addCloseHandler).toHaveBeenCalledTimes(1);
++    expect(addCloseHandler).toHaveBeenCalledTimes(2);
+     harness.send({
+       method: "account/rateLimits/updated",
+       params: { rateLimits: { primary: { usedPercent: 12 } } },
+@@ -1040,7 +1040,7 @@ describe("Codex app-server client runtime", () => {
+     vi.resetModules();
+     const nextCopy = await import("./client-runtime.js");
+     nextCopy.ensureCodexAppServerClientRuntime(harness.client, { agentDir: "/tmp/agent" });
+-    expect(addCloseHandler).toHaveBeenCalledTimes(1);
++    expect(addCloseHandler).toHaveBeenCalledTimes(2);
+     expect(nextCopy.isCodexAppServerClientRuntimeLive(harness.client)).toBe(true);
+     expect(nextCopy.hasCodexAppServerLiveThread(harness.client, "copy-retained")).toBe(true);
+     const claimed = await nextCopy.claimCodexAppServerLiveThread(harness.client, "copy-retained");
+diff --git a/extensions/codex/src/app-server/client-runtime.ts b/extensions/codex/src/app-server/client-runtime.ts
+index 20080e5e6c6..b50265cfc75 100644
+--- a/extensions/codex/src/app-server/client-runtime.ts
++++ b/extensions/codex/src/app-server/client-runtime.ts
+@@ -28,7 +28,12 @@ import {
+ import type { CodexAppServerClient } from "./client.js";
+ import { isJsonObject, type CodexServiceTier, type JsonObject } from "./protocol.js";
+ import { mergeCodexRateLimitsUpdate } from "./rate-limit-cache.js";
++import { openCodexNativeThreadSettings } from "./thread-native-settings.js";
+ import { withTimeout } from "./timeout.js";
++export {
++  readCodexNativeThreadSettings,
++  recordCodexNativeThreadSettings,
++} from "./thread-native-settings.js";
+ 
+ type ThreadRelease = CodexAppServerLiveThreadOwnership["release"];
+ 
+@@ -131,6 +136,7 @@ export function ensureCodexAppServerClientRuntime(
+     workspaceReferences: new Map(),
+   };
+   configuredClients.set(client, runtime);
++  openCodexNativeThreadSettings(client);
+   client.addCloseHandler(() => {
+     // Pending releases may settle after close; their continuations must never
+     // resurrect subscriptions or eviction timers on a dead physical client.
+diff --git a/extensions/codex/src/app-server/protocol.ts b/extensions/codex/src/app-server/protocol.ts
+index 9ede1b88c17..12059b5dc73 100644
+--- a/extensions/codex/src/app-server/protocol.ts
++++ b/extensions/codex/src/app-server/protocol.ts
+@@ -4,6 +4,10 @@ import type * as Control from "./protocol-control-plane.js";
+ import type { JsonObject, JsonValue } from "./protocol-json.js";
+ import type * as CodexMcpProtocol from "./protocol-mcp.js";
+ import type { CodexSessionSource, CodexThreadSourceKind } from "./protocol-session-source.js";
++import type {
++  CodexNativeCollaborationMode,
++  CodexNativeCollaborationModeInput,
++} from "./thread-native-settings.js";
+ 
+ export type {
+   CodexConfigReadResponse,
+@@ -175,6 +179,13 @@ export type CodexThreadStartResponse = {
+   thread: CodexThread;
+   model: string;
+   modelProvider?: string | null;
++  /** Effective native effort for this newly started thread, when reported by the app-server. */
++  reasoningEffort?: string | null;
++};
++
++type CodexThreadSettingsUpdateParams = JsonObject & {
++  threadId: string;
++  collaborationMode: CodexNativeCollaborationMode;
+ };
+ 
+ export type CodexThreadForkParams = JsonObject & {
+@@ -272,6 +283,8 @@ type CodexInitialTurnsPage = Omit<CodexThreadTurnsListResponse, "data"> & {
+ 
+ export type CodexThreadResumeResponse = CodexThreadStartResponse & {
+   cwd: string;
++  /** Effective native collaboration mode; absent on older app-server versions. */
++  collaborationMode?: CodexNativeCollaborationModeInput | null;
+   initialTurnsPage?: CodexInitialTurnsPage | null;
+ };
+ 
+@@ -433,6 +446,15 @@ type CodexStrictReviewRequiredNotification = {
+ 
+ export type CodexServerNotification =
+   | CodexStrictReviewRequiredNotification
++  | {
++      method: "thread/settings/updated";
++      params: JsonObject & {
++        threadId: string;
++        threadSettings: JsonObject & {
++          collaborationMode?: CodexNativeCollaborationModeInput | null;
++        };
++      };
++    }
+   | {
+       method: string;
+       params?: JsonValue;
+@@ -672,6 +694,10 @@ type CodexAppServerRequests = {
+   >;
+   "thread/resume": CodexRequestContract<CodexThreadResumeParams, CodexThreadResumeResponse>;
+   "thread/start": CodexRequestContract<CodexThreadStartParams, CodexThreadStartResponse>;
++  "thread/settings/update": CodexRequestContract<
++    CodexThreadSettingsUpdateParams,
++    Record<string, never>
++  >;
+   "thread/unarchive": CodexRequestContract<CodexThreadIdParams, { thread: CodexThread }>;
+   "thread/unsubscribe": CodexRequestContract<CodexThreadIdParams, JsonValue>;
+   "thread/goal/set": CodexRequestContract<CodexThreadGoalSetParams, { goal: CodexThreadGoal }>;
+diff --git a/extensions/codex/src/app-server/run-attempt-connection.ts b/extensions/codex/src/app-server/run-attempt-connection.ts
+index 1ff25490c94..b466c7903ab 100644
+--- a/extensions/codex/src/app-server/run-attempt-connection.ts
++++ b/extensions/codex/src/app-server/run-attempt-connection.ts
+@@ -1,6 +1,7 @@
+ import { createAgentHarnessAttemptCancellation } from "openclaw/plugin-sdk/agent-harness-attempt-runtime";
+ import {
+   isActiveHarnessContextEngine,
++  resolveSessionPlanModeLaunchPermissionMode,
+   resolveSandboxContext,
+   resolveUserPath,
+   type FastModeAutoProgressState,
+@@ -55,6 +56,7 @@ import {
+ } from "./session-binding.js";
+ import {
+   applyCodexSessionPermissionPolicy,
++  CODEX_SESSION_PERMISSION_EXEC_MODES,
+   resolveCodexEffectiveSessionPermissionPolicy,
+   resolveCodexSessionPermissionCwd,
+ } from "./session-permission-policy.js";
+@@ -121,11 +123,27 @@ export async function prepareCodexAttemptConnection({ params, options }: CodexRu
+       ? createIsolatedCodexAppServerClient
+       : getLeasedSharedCodexAppServerClient);
+   preDynamicStartupStages.mark("sandbox");
++  const launchPermissionMode = resolveSessionPlanModeLaunchPermissionMode({
++    planMode: params.planMode,
++    storedPermissionMode: params.storedPermissionMode,
++    effectivePermissionMode: params.permissionMode,
++  });
++  const launchExecOverrides = { ...params.execOverrides };
++  if (params.planMode === true) {
++    if (launchPermissionMode) {
++      launchExecOverrides.mode = CODEX_SESSION_PERMISSION_EXEC_MODES[launchPermissionMode];
++    } else {
++      // `execOverrides.mode` is synthesized from the effective read-only mode
++      // by the shared runner. With no saved session mode, let host config own
++      // launch admission instead of treating that clamp as launch authority.
++      delete launchExecOverrides.mode;
++    }
++  }
+   const execPolicy = resolveOpenClawExecPolicyForCodexAppServer({
+     // Explicit modes replace legacy fields; full also replaces approval-file floors.
+-    permissionMode: params.permissionMode,
+-    execOverrides: params.execOverrides,
+-    approvals: params.permissionMode === "full" ? undefined : loadExecApprovals(),
++    permissionMode: launchPermissionMode,
++    execOverrides: launchExecOverrides,
++    approvals: launchPermissionMode === "full" ? undefined : loadExecApprovals(),
+     config: params.config,
+     agentId: policyAgentId,
+   });
+@@ -285,7 +303,7 @@ export async function prepareCodexAttemptConnection({ params, options }: CodexRu
+         agentDir,
+         requirementsToml,
+         openClawSandboxActive: sandbox?.enabled === true,
+-        sessionPermissionMode: params.permissionMode,
++        sessionPermissionMode: launchPermissionMode,
+         assertCurrent,
+       })
+     ).appServer;
+@@ -404,7 +422,7 @@ export async function prepareCodexAttemptConnection({ params, options }: CodexRu
+         codexArgs: appServer.start.args,
+       }),
+       requirementsToml,
+-      policyLocked: startupBinding?.connectionScope === "supervision",
++      policyLocked: startupBinding?.connectionScope === "supervision" && params.planMode !== true,
+       execMode: execPolicy.mode,
+     });
+   const resolveFinalAppServer = (
+diff --git a/extensions/codex/src/app-server/run-attempt-turn-request.ts b/extensions/codex/src/app-server/run-attempt-turn-request.ts
+index 44ab2086420..e60663d1eb4 100644
+--- a/extensions/codex/src/app-server/run-attempt-turn-request.ts
++++ b/extensions/codex/src/app-server/run-attempt-turn-request.ts
+@@ -11,7 +11,10 @@ import {
+   assertCodexSessionRuntimeOwnership,
+   requireCodexSupervisionModelSelection,
+ } from "./binding-connection.js";
+-import { prepareCodexWorkspaceReferences } from "./client-runtime.js";
++import {
++  prepareCodexWorkspaceReferences,
++  readCodexNativeThreadSettings,
++} from "./client-runtime.js";
+ import { isCodexAppServerIndeterminateRequestCancellationError } from "./client.js";
+ import { joinPresentSections } from "./developer-instruction-sections.js";
+ import { resolveCodexExplicitSkillInputs } from "./explicit-skill-input.js";
+@@ -197,6 +200,11 @@ export async function prepareCodexAttemptTurnRequest(
+             modelProvider: resourceState.thread.modelProvider,
+           }),
+       preserveNativeTurnSettings: usesSupervisionConnection,
++      newNativeThread: resourceState.thread.lifecycle.action === "started",
++      nativeCollaborationMode: readCodexNativeThreadSettings(
++        resourceState.client,
++        resourceState.thread.threadId,
++      ),
+       parentLocalEgress: inferenceRoute !== undefined,
+       messageToolAvailable: toolBridge.availableTools.some((tool) => tool.name === "message"),
+       requireExplicitMessageTarget: attemptTools.requireExplicitMessageTarget,
+diff --git a/extensions/codex/src/app-server/session-permission-policy.test.ts b/extensions/codex/src/app-server/session-permission-policy.test.ts
+index 98ed2f801b7..b1c4d33273b 100644
+--- a/extensions/codex/src/app-server/session-permission-policy.test.ts
++++ b/extensions/codex/src/app-server/session-permission-policy.test.ts
+@@ -73,6 +73,34 @@ describe("Codex session permission policy", () => {
+     });
+   });
+ 
++  it("keeps bound Plan read-only without requesting an unsupported user approval", () => {
++    expect(
++      applyPolicy({ permissionMode: "read-only", nativeConversationPlanMode: true }),
++    ).toMatchObject({
++      sandbox: "read-only",
++      approvalPolicy: "never",
++      approvalsReviewer: "user",
++    });
++  });
++
++  it("does not override managed requirements that require an interactive Plan approval", () => {
++    expect(
++      applyPolicy({
++        permissionMode: "read-only",
++        nativeConversationPlanMode: true,
++        requirementsToml: [
++          'allowed_sandbox_modes = ["read-only"]',
++          'allowed_approval_policies = ["on-request"]',
++          'allowed_approvals_reviewers = ["user"]',
++        ].join("\n"),
++      }),
++    ).toMatchObject({
++      sandbox: "read-only",
++      approvalPolicy: "on-request",
++      approvalsReviewer: "user",
++    });
++  });
++
+   it("downgrades workspace review to the user when model-backed review is untrusted", () => {
+     expect(
+       applyPolicy({
+diff --git a/extensions/codex/src/app-server/session-permission-policy.ts b/extensions/codex/src/app-server/session-permission-policy.ts
+index 446b08ea8b3..f507be4d3dd 100644
+--- a/extensions/codex/src/app-server/session-permission-policy.ts
++++ b/extensions/codex/src/app-server/session-permission-policy.ts
+@@ -41,9 +41,13 @@ type CodexSessionPermissionTuple = {
+ function tupleForMode(
+   mode: SessionPermissionMode,
+   canUseAutoReview: boolean,
++  nativeConversationPlanMode: boolean,
+ ): CodexSessionPermissionTuple {
+   switch (mode) {
+     case "read-only":
++      if (nativeConversationPlanMode) {
++        return { sandbox: "read-only", approvalPolicy: "never", approvalsReviewer: "user" };
++      }
+       return { sandbox: "read-only", approvalPolicy: "on-request", approvalsReviewer: "user" };
+     case "guarded":
+     case "workspace":
+@@ -170,6 +174,7 @@ export function applyCodexSessionPermissionPolicy(params: {
+   hostName?: string;
+   policyLocked?: boolean;
+   execMode?: OpenClawExecMode;
++  nativeConversationPlanMode?: boolean;
+ }): CodexAppServerRuntimeOptions {
+   if (!params.permissionMode) {
+     return params.appServer;
+@@ -180,7 +185,11 @@ export function applyCodexSessionPermissionPolicy(params: {
+   }
+ 
+   const requested = tightenTupleForExecMode(
+-    tupleForMode(params.permissionMode, params.canUseAutoReview),
++    tupleForMode(
++      params.permissionMode,
++      params.canUseAutoReview,
++      params.nativeConversationPlanMode === true,
++    ),
+     params.execMode,
+     params.appServer.approvalPolicy === "untrusted",
+   );
+diff --git a/extensions/codex/src/app-server/side-question.ts b/extensions/codex/src/app-server/side-question.ts
+index 3d25ad6ee10..00202a7ac96 100644
+--- a/extensions/codex/src/app-server/side-question.ts
++++ b/extensions/codex/src/app-server/side-question.ts
+@@ -16,7 +16,6 @@ import {
+   loadCodexBundleMcpApprovalConfig,
+   resolveCodexMcpToolOverridesForAgent,
+ } from "openclaw/plugin-sdk/codex-mcp-projection";
+-import { loadExecApprovals } from "openclaw/plugin-sdk/exec-approvals-runtime";
+ import { registerNativeHookRelayForBundledRuntime } from "openclaw/plugin-sdk/native-hook-relay-runtime";
+ import { readStringField as readString } from "openclaw/plugin-sdk/string-coerce-runtime";
+ import { resolveCodexAppServerForModelProvider } from "./app-server-policy.js";
+@@ -27,6 +26,7 @@ import {
+   requireCodexSupervisionModelSelection,
+   resolveCodexBindingAppServerConnection,
+ } from "./binding-connection.js";
++import { readCodexNativeThreadSettings } from "./client-runtime.js";
+ import {
+   isCodexAppServerApprovalRequest,
+   isCodexAppServerIndeterminateRequestCancellationError,
+@@ -41,7 +41,6 @@ import {
+   readCodexPluginConfig,
+   readCodexRequirementsToml,
+   resolveCodexAppServerHomeScope,
+-  resolveOpenClawExecPolicyForCodexAppServer,
+   resolveCodexModelBackedReviewerPolicyContext,
+   shouldAutoApproveCodexAppServerApprovals,
+   withMcpElicitationsApprovalPolicy,
+@@ -109,7 +108,6 @@ import { resolveCodexNativeExecutionBlock } from "./sandbox-guard.js";
+ import { sessionBindingIdentity, resolveCodexSessionBinding } from "./session-binding.js";
+ import {
+   applyCodexSessionPermissionPolicy,
+-  CODEX_SESSION_PERMISSION_EXEC_MODES,
+   resolveCodexEffectiveSessionPermissionPolicy,
+   resolveCodexSessionPermissionCwd,
+   type CodexEffectiveSessionPermissionPolicy,
+@@ -129,6 +127,12 @@ import {
+   CODEX_NATIVE_PERSONALITY_NONE,
+   resolveCodexAppServerThreadModelSelection,
+ } from "./thread-lifecycle.js";
++import {
++  buildCodexNativeTurnStartModeParams,
++  resolveCodexNativeCollaborationMode,
++  resolveCodexSessionModePolicy,
++  type CodexNativeCollaborationMode,
++} from "./thread-native-settings.js";
+ import {
+   assertCodexSupervisionThreadLineage,
+   CodexThreadPolicyHandoffError,
+@@ -190,15 +194,10 @@ export async function runCodexAppServerSideQuestion(
+   });
+   const agentWorkspaceDir =
+     params.workspaceDir?.trim() || resolveAgentWorkspaceDir(params.cfg, sessionAgentId);
+-  const execPolicy = resolveOpenClawExecPolicyForCodexAppServer({
+-    permissionMode: params.sessionEntry.permissionMode,
+-    execOverrides: params.sessionEntry.permissionMode
+-      ? { mode: CODEX_SESSION_PERMISSION_EXEC_MODES[params.sessionEntry.permissionMode] }
+-      : undefined,
+-    approvals: params.sessionEntry.permissionMode === "full" ? undefined : loadExecApprovals(),
+-    config: params.cfg,
+-    agentId: sessionAgentId,
+-  });
++  const { permissionMode, launchPermissionMode, execPolicy } = resolveCodexSessionModePolicy(
++    params.sessionEntry,
++    { config: params.cfg, agentId: sessionAgentId },
++  );
+   const usesSupervisionConnection = binding.connectionScope === "supervision";
+   const supervisionModelSelection = usesSupervisionConnection
+     ? requireCodexSupervisionModelSelection(binding)
+@@ -241,6 +240,7 @@ export async function runCodexAppServerSideQuestion(
+     model: reviewerPolicyContext.model,
+     config: params.cfg,
+     agentDir: params.agentDir,
++    sessionPermissionMode: launchPermissionMode,
+   });
+   const reviewerContext = {
+     modelProvider: reviewerPolicyContext.modelProvider,
+@@ -252,13 +252,13 @@ export async function runCodexAppServerSideQuestion(
+   const appServer = resolveCodexAppServerForModelProvider({
+     appServer: applyCodexSessionPermissionPolicy({
+       appServer: connection.appServer,
+-      permissionMode: params.sessionEntry.permissionMode,
++      permissionMode,
+       sessionRoot: params.sessionEntry.sessionRoot,
+       defaultRoot: agentWorkspaceDir,
+       pluginConfig,
+       canUseAutoReview: canUseCodexModelBackedApprovalsReviewerForModel(reviewerContext),
+       requirementsToml: readCodexRequirementsToml({}),
+-      policyLocked: usesSupervisionConnection,
++      policyLocked: usesSupervisionConnection && params.sessionEntry.planMode !== true,
+       execMode: execPolicy.mode,
+     }),
+     ...reviewerContext,
+@@ -281,12 +281,12 @@ export async function runCodexAppServerSideQuestion(
+ 
+   const sessionPermissionPolicy = resolveCodexEffectiveSessionPermissionPolicy({
+     appServer,
+-    permissionMode: params.sessionEntry.permissionMode,
++    permissionMode,
+     sessionRoot: params.sessionEntry.sessionRoot,
+     defaultRoot: agentWorkspaceDir,
+   });
+   const cwd = resolveCodexSessionPermissionCwd({
+-    permissionMode: params.sessionEntry.permissionMode,
++    permissionMode,
+     sessionRoot: params.sessionEntry.sessionRoot,
+     defaultRoot: agentWorkspaceDir,
+     requestedCwd: binding.cwd,
+@@ -393,6 +393,7 @@ export async function runCodexAppServerSideQuestion(
+   let nativeHookRelay: ReturnType<typeof registerNativeHookRelayForBundledRuntime> | undefined;
+   const activeDynamicToolCalls = new Set<Promise<unknown>>();
+   let primaryFailure: { error: unknown } | undefined;
++  let planCollaborationMode: CodexNativeCollaborationMode | undefined;
+   const releaseSandboxEnvironment = async () => {
+     if (!sandboxEnvironment) {
+       return;
+@@ -665,6 +666,7 @@ export async function runCodexAppServerSideQuestion(
+               };
+             };
+             assertCurrentBinding();
++            planCollaborationMode = undefined;
+             if (binding.connectionScope === "supervision") {
+               const { thread } = await forkClient.request(
+                 "thread/read",
+@@ -677,6 +679,11 @@ export async function runCodexAppServerSideQuestion(
+               assertCurrentBinding();
+               assertCodexSupervisionThreadLineage(binding, thread);
+             }
++            planCollaborationMode = resolveCodexNativeCollaborationMode({
++              planMode: params.sessionEntry.planMode,
++              nativeSettings: readCodexNativeThreadSettings(forkClient, binding.threadId),
++              selectedModel: modelSelection.model,
++            });
+             await ensureSandboxEnvironment(forkClient);
+             assertCurrentBinding();
+             const executionCwd = sandboxEnvironment?.cwd ?? cwd;
+@@ -833,19 +840,12 @@ export async function runCodexAppServerSideQuestion(
+             model: modelSelection.model,
+             ...(usesSupervisionConnection ? {} : { personality: CODEX_NATIVE_PERSONALITY_NONE }),
+             ...(serviceTier ? { serviceTier } : {}),
+-            ...(usesSupervisionConnection
+-              ? {}
+-              : {
+-                  effort,
+-                  collaborationMode: {
+-                    mode: "default" as const,
+-                    settings: {
+-                      model: modelSelection.model,
+-                      reasoning_effort: effort,
+-                      developer_instructions: null,
+-                    },
+-                  },
+-                }),
++            ...buildCodexNativeTurnStartModeParams({
++              planCollaborationMode,
++              usesSupervisionConnection,
++              model: modelSelection.model,
++              effort: effort ?? undefined,
++            }),
+           },
+           {
+             timeoutMs: appServer.requestTimeoutMs,
+diff --git a/extensions/codex/src/app-server/thread-lifecycle-io.ts b/extensions/codex/src/app-server/thread-lifecycle-io.ts
+index 5ecbabf79ea..9a49e0affcc 100644
+--- a/extensions/codex/src/app-server/thread-lifecycle-io.ts
++++ b/extensions/codex/src/app-server/thread-lifecycle-io.ts
+@@ -220,6 +220,7 @@ export async function resumeExistingCodexThread(
+     acceptedConfiguration = configuration;
+     assertCodexThreadAcceptsDirectInput(response.thread);
+     configuration.assertConfigured();
++    configuration.assertCurrent();
+     if (requestModelProvider && response.modelProvider !== requestModelProvider) {
+       throw new Error(
+         "Codex resumed a different model provider than the one selected for this turn",
+diff --git a/extensions/codex/src/app-server/thread-resume.ts b/extensions/codex/src/app-server/thread-resume.ts
+index 298ce2c6161..f9c4266b14e 100644
+--- a/extensions/codex/src/app-server/thread-resume.ts
++++ b/extensions/codex/src/app-server/thread-resume.ts
+@@ -2,13 +2,16 @@
+ import { sanitizeTerminalText } from "openclaw/plugin-sdk/text-chunking";
+ import { publishCodexCatalogResume } from "../session-catalog-events.js";
+ import {
+-  assertCodexThreadResumeSubscription,
+   CODEX_APP_SERVER_UNSUBSCRIBE_TIMEOUT_MS,
+   CodexAppServerUnsafeSubscriptionError,
++  assertCodexThreadResumeSubscription,
+   unsubscribeCodexThreadBestEffort,
+ } from "./attempt-client-cleanup.js";
+ import { isCodexAppServerStartupError } from "./attempt-timeouts.js";
+-import { forgetCodexWorkspaceReferences } from "./client-runtime.js";
++import {
++  forgetCodexWorkspaceReferences,
++  recordCodexNativeThreadSettings,
++} from "./client-runtime.js";
+ import {
+   CodexAppServerRpcError,
+   isCodexAppServerOverloadError,
+@@ -46,7 +49,9 @@ export async function resumeCodexAppServerThread(params: {
+           })),
+     );
+     assertCodexThreadResumeSubscription(threadId, response.thread.id);
++    params.assertCurrent?.();
+     forgetCodexWorkspaceReferences(params.client, threadId);
++    recordCodexNativeThreadSettings(params.client, response.thread.id, response.collaborationMode);
+   } catch (error) {
+     if (
+       isCodexAppServerStartSelectionChangedError(error) ||
+diff --git a/extensions/codex/src/app-server/turn-params.test.ts b/extensions/codex/src/app-server/turn-params.test.ts
+index 4b584b36508..ce20bfa22fd 100644
+--- a/extensions/codex/src/app-server/turn-params.test.ts
++++ b/extensions/codex/src/app-server/turn-params.test.ts
+@@ -58,6 +58,101 @@ describe("buildTurnStartParams active computer context", () => {
+   });
+ });
+ 
++describe("buildTurnStartParams Plan mode", () => {
++  const nativeCollaborationMode = {
++    mode: "default",
++    settings: {
++      model: "imported-native-model",
++      reasoning_effort: "high",
++      developer_instructions: "Keep the original native developer instructions.",
++    },
++  } as const;
++  const nativePlanMode = { ...nativeCollaborationMode, mode: "plan" } as const;
++
++  it("resets native instructions while preserving model and effort when setting Plan", () => {
++    const params = createParams("/tmp/session.jsonl", "/repo");
++    params.planMode = true;
++    const turn = buildTurnStartParams(params, {
++      threadId: "native-plan-thread",
++      cwd: "/repo",
++      appServer: createAppServerOptions(),
++      preserveNativeTurnSettings: true,
++      nativeCollaborationMode,
++    });
++
++    expect(turn.collaborationMode).toEqual({
++      ...nativeCollaborationMode,
++      mode: "plan",
++      settings: { ...nativeCollaborationMode.settings, developer_instructions: null },
++    });
++    expect(turn.effort).toBe("high");
++    expect(turn.model).toBeUndefined();
++    expect(turn.input).toEqual([{ type: "text", text: params.prompt, text_elements: [] }]);
++  });
++
++  it("resets native instructions when changing from Plan to Default", () => {
++    const params = createParams("/tmp/session.jsonl", "/repo");
++    params.planMode = false;
++    const turn = buildTurnStartParams(params, {
++      threadId: "native-default-thread",
++      cwd: "/repo",
++      appServer: createAppServerOptions(),
++      preserveNativeTurnSettings: true,
++      nativeCollaborationMode: nativePlanMode,
++    });
++
++    expect(turn.collaborationMode).toEqual({
++      ...nativePlanMode,
++      mode: "default",
++      settings: { ...nativePlanMode.settings, developer_instructions: null },
++    });
++    expect(turn.effort).toBe("high");
++  });
++
++  it("leaves a native mode untouched when OpenClaw has no explicit Plan override", () => {
++    const params = createParams("/tmp/session.jsonl", "/repo");
++    const turn = buildTurnStartParams(params, {
++      threadId: "native-plan-thread",
++      cwd: "/repo",
++      appServer: createAppServerOptions(),
++      preserveNativeTurnSettings: true,
++      nativeCollaborationMode: nativePlanMode,
++    });
++
++    expect(turn.collaborationMode).toBeUndefined();
++    expect(turn.model).toBeUndefined();
++  });
++
++  it("fails closed when an explicit mode change lacks a complete native snapshot", () => {
++    const params = createParams("/tmp/session.jsonl", "/repo");
++    params.planMode = true;
++
++    expect(() =>
++      buildTurnStartParams(params, {
++        threadId: "native-plan-thread",
++        cwd: "/repo",
++        appServer: createAppServerOptions(),
++        preserveNativeTurnSettings: true,
++      }),
++    ).toThrow("Cannot change native Codex Plan mode without a complete thread settings snapshot");
++  });
++
++  it("uses the current run settings when setting Plan on a newly started thread", () => {
++    const params = createParams("/tmp/session.jsonl", "/repo");
++    params.planMode = true;
++    const turn = buildTurnStartParams(params, {
++      threadId: "new-native-thread",
++      cwd: "/repo",
++      appServer: createAppServerOptions(),
++      preserveNativeTurnSettings: true,
++      newNativeThread: true,
++    });
++
++    expect(turn.collaborationMode?.mode).toBe("plan");
++    expect(turn.collaborationMode?.settings.model).toBe(params.modelId);
++  });
++});
++
+ describe("buildTurnStartParams model thinking defaults", () => {
+   it.each([
+     { thinking: undefined, thinkingDefault: undefined, expected: "medium" },
+diff --git a/extensions/codex/src/app-server/turn-params.ts b/extensions/codex/src/app-server/turn-params.ts
+index 22c18496e08..c54b6122a07 100644
+--- a/extensions/codex/src/app-server/turn-params.ts
++++ b/extensions/codex/src/app-server/turn-params.ts
+@@ -28,6 +28,10 @@ import {
+   CODEX_NATIVE_PERSONALITY_NONE,
+   resolveCodexAppServerRequestModelSelection,
+ } from "./thread-model-selection.js";
++import {
++  withCodexNativeCollaborationMode,
++  type CodexNativeCollaborationMode,
++} from "./thread-native-settings.js";
+ import { buildCodexUserInput } from "./user-input.js";
+ 
+ const CODEX_CURRENT_SENDER_FIELD_MAX_CHARS = 256;
+@@ -92,6 +96,8 @@ export function buildTurnStartParams(
+     model?: string | null;
+     modelProvider?: string | null;
+     preserveNativeTurnSettings?: boolean;
++    newNativeThread?: boolean;
++    nativeCollaborationMode?: CodexNativeCollaborationMode;
+     parentLocalEgress?: boolean;
+     clearInheritedServiceTier?: boolean;
+     sessionStatusAvailable?: boolean;
+@@ -111,12 +117,28 @@ export function buildTurnStartParams(
+         agentDir: params.agentDir,
+         config: params.config,
+       });
+-  const collaborationMode = modelSelection
+-    ? buildTurnCollaborationMode(params, {
+-        model: modelSelection.model,
+-      })
+-    : undefined;
+-  if (collaborationMode && options.parentLocalEgress) {
++  const preserveNativeThreadSettings =
++    options.preserveNativeTurnSettings === true && options.newNativeThread !== true;
++  let collaborationMode: CodexTurnCollaborationMode | undefined;
++  if (preserveNativeThreadSettings) {
++    if (params.planMode !== undefined) {
++      if (!options.nativeCollaborationMode) {
++        throw new Error(
++          "Cannot change native Codex Plan mode without a complete thread settings snapshot.",
++        );
++      }
++      collaborationMode = withCodexNativeCollaborationMode(
++        options.nativeCollaborationMode,
++        params.planMode ? "plan" : "default",
++      );
++    }
++  } else if (modelSelection || params.planMode !== undefined) {
++    collaborationMode = buildTurnCollaborationMode(params, {
++      model: modelSelection?.model ?? params.modelId,
++      mode: params.planMode === true ? "plan" : "default",
++    });
++  }
++  if (collaborationMode && options.parentLocalEgress && !preserveNativeThreadSettings) {
+     // Catalog collaboration stays native; parent-local context exists only at inference egress.
+     collaborationMode.settings.developer_instructions = null;
+   }
+@@ -241,11 +263,12 @@ export function buildTurnCollaborationMode(
+   params: EmbeddedRunAttemptParams,
+   options: {
+     model?: string;
++    mode?: "plan" | "default";
+   } = {},
+ ): CodexTurnCollaborationMode {
+   const model = options.model ?? params.modelId;
+   return {
+-    mode: "default",
++    mode: options.mode ?? "default",
+     settings: {
+       model,
+       reasoning_effort: resolveCodexAppServerReasoningEffort({
+diff --git a/extensions/codex/src/conversation-binding-preparation.ts b/extensions/codex/src/conversation-binding-preparation.ts
+index 7940dd5c969..30435bb2096 100644
+--- a/extensions/codex/src/conversation-binding-preparation.ts
++++ b/extensions/codex/src/conversation-binding-preparation.ts
+@@ -5,7 +5,6 @@ import {
+ } from "openclaw/plugin-sdk/agent-harness-runtime";
+ import { resolveAgentWorkspaceDir } from "openclaw/plugin-sdk/agent-runtime";
+ import { resolveSessionAgentIdsStrict } from "openclaw/plugin-sdk/agent-scope-runtime";
+-import { loadExecApprovals } from "openclaw/plugin-sdk/exec-approvals-runtime";
+ import {
+   getSessionEntry,
+   resolveStorePath,
+@@ -13,7 +12,12 @@ import {
+ } from "openclaw/plugin-sdk/session-store-runtime";
+ import { readVisibleSessionTranscriptMessageEntries } from "openclaw/plugin-sdk/session-transcript-runtime";
+ import { resolveCodexAppServerForModelProvider } from "./app-server/app-server-policy.js";
+-import { closeCodexStartupClientBestEffort } from "./app-server/attempt-client-cleanup.js";
++import {
++  CODEX_APP_SERVER_UNSUBSCRIBE_TIMEOUT_MS,
++  closeCodexStartupClientBestEffort,
++  retireUnsafeCodexTurnClientBestEffort,
++  unsubscribeCodexThreadBestEffort,
++} from "./app-server/attempt-client-cleanup.js";
+ import {
+   isCodexAppServerNativeAuthProfile,
+   normalizeCodexAppServerBindingModelProvider,
+@@ -31,7 +35,6 @@ import {
+   canUseCodexModelBackedApprovalsReviewerForModel,
+   readCodexPluginConfig,
+   readCodexRequirementsToml,
+-  resolveOpenClawExecPolicyForCodexAppServer,
+   resolveCodexAppServerRuntimeOptions,
+ } from "./app-server/config.js";
+ import {
+@@ -39,7 +42,10 @@ import {
+   mergeCodexThreadConfigs,
+ } from "./app-server/plugin-thread-config.js";
+ import { buildCodexProjectDocThreadConfig } from "./app-server/project-doc-thread-config.js";
+-import { assertCodexThreadAcceptsDirectInput } from "./app-server/protocol-validators.js";
++import {
++  assertCodexThreadAcceptsDirectInput,
++  assertCodexThreadStartResponse,
++} from "./app-server/protocol-validators.js";
+ import type {
+   CodexServiceTier,
+   CodexThreadResumeResponse,
+@@ -54,7 +60,6 @@ import {
+ } from "./app-server/session-binding.js";
+ import {
+   applyCodexSessionPermissionPolicy,
+-  CODEX_SESSION_PERMISSION_EXEC_MODES,
+   resolveCodexSessionPermissionCwd,
+ } from "./app-server/session-permission-policy.js";
+ import {
+@@ -70,6 +75,12 @@ import {
+   CODEX_NATIVE_PERSONALITY_NONE,
+   resolveCodexAppServerRequestModelSelection,
+ } from "./app-server/thread-lifecycle.js";
++import {
++  resolveCodexNativeCollaborationMode,
++  resolveCodexSessionModePolicy,
++  updateCodexFreshThreadSettings,
++  type CodexNativeCollaborationMode,
++} from "./app-server/thread-native-settings.js";
+ import {
+   isSameCodexAppServerThreadOwner,
+   releaseCodexAppServerBindingSubscription,
+@@ -105,6 +116,7 @@ export async function resolveConversationAppServerRuntime(params: {
+ }): Promise<{
+   runtime: ReturnType<typeof resolveCodexAppServerRuntimeOptions>;
+   workspaceDir: string;
++  planMode: boolean | undefined;
+ }> {
+   const source = params.source;
+   const agentId =
+@@ -138,7 +150,12 @@ export async function resolveConversationAppServerRuntime(params: {
+       "Codex conversation source session is missing or no longer current; rebind this conversation before retrying.",
+     );
+   }
+-  const permissionMode = entry?.permissionMode;
++  const planMode = entry?.planMode;
++  // Plan clamps the native sandbox; process launch follows saved authority.
++  const { permissionMode, launchPermissionMode, execPolicy } = resolveCodexSessionModePolicy(
++    entry,
++    { config: params.config, agentId },
++  );
+   const sessionRoot = permissionMode ? entry?.sessionRoot : undefined;
+   // The rootless permission boundary comes from agent config only. A bound
+   // thread's requested cwd (/codex bind --cwd) must never widen or become it.
+@@ -146,15 +163,6 @@ export async function resolveConversationAppServerRuntime(params: {
+     params.config && agentId
+       ? resolveAgentWorkspaceDir(params.config, agentId)
+       : resolveCodexDefaultWorkspaceDir(params.pluginConfig);
+-  const execPolicy = resolveOpenClawExecPolicyForCodexAppServer({
+-    config: params.config,
+-    agentId,
+-    permissionMode,
+-    execOverrides: permissionMode
+-      ? { mode: CODEX_SESSION_PERMISSION_EXEC_MODES[permissionMode] }
+-      : undefined,
+-    approvals: permissionMode === "full" ? undefined : loadExecApprovals(),
+-  });
+   const sandboxForPolicy =
+     execPolicy.touched && execPolicy.security === "full" && execPolicy.ask !== "off"
+       ? await resolveSandboxContext({
+@@ -171,6 +179,7 @@ export async function resolveConversationAppServerRuntime(params: {
+     config: params.config,
+     agentDir: params.agentDir,
+     openClawSandboxActive: Boolean(sandboxForPolicy?.enabled),
++    sessionPermissionMode: launchPermissionMode,
+   });
+   const canUseAutoReview = canUseCodexModelBackedApprovalsReviewerForModel({
+     modelProvider: params.modelProvider,
+@@ -188,6 +197,7 @@ export async function resolveConversationAppServerRuntime(params: {
+     canUseAutoReview,
+     requirementsToml: readCodexRequirementsToml({}),
+     execMode: execPolicy.mode,
++    nativeConversationPlanMode: planMode === true,
+   });
+   return {
+     runtime: resolveCodexAppServerForModelProvider({
+@@ -205,6 +215,7 @@ export async function resolveConversationAppServerRuntime(params: {
+       requestedCwd: params.workspaceDir,
+       fallbackCwd: params.workspaceDir,
+     }),
++    planMode,
+   };
+ }
+ 
+@@ -255,7 +266,7 @@ async function resolveThreadBindingRuntime(params: CodexThreadBindingParams) {
+     modelProvider: params.modelProvider,
+     ...agentLookup,
+   });
+-  const { runtime, workspaceDir } = await resolveConversationAppServerRuntime({
++  const { runtime, workspaceDir, planMode } = await resolveConversationAppServerRuntime({
+     pluginConfig: params.pluginConfig,
+     config: params.config,
+     agentId: params.agentId,
+@@ -276,6 +287,7 @@ async function resolveThreadBindingRuntime(params: CodexThreadBindingParams) {
+   return {
+     runtime,
+     workspaceDir,
++    planMode,
+     agentLookup,
+     model: modelSelection?.model,
+     modelProvider: modelSelection?.modelProvider ?? modelProvider,
+@@ -406,6 +418,7 @@ async function bindThread(params: CodexThreadBindingParams, threadId?: string):
+           requestOptions,
+         );
+         let response: CodexThreadResumeResponse | CodexThreadStartResponse;
++        let startedThread: CodexThreadStartResponse | undefined;
+         // Codex applies network-proxy permission profiles at thread/start. Resuming
+         // an arbitrary existing thread cannot prove that profile is active.
+         if (threadId && !resolved.runtime.networkProxy) {
+@@ -437,16 +450,43 @@ async function bindThread(params: CodexThreadBindingParams, threadId?: string):
+               client.request("thread/resume", resumeRequest, requestOptions()),
+           });
+         } else {
+-          response = await client.request(
+-            "thread/start",
+-            {
+-              ...request,
+-              developerInstructions: CODEX_CONVERSATION_THREAD_DEVELOPER_INSTRUCTIONS,
+-              experimentalRawEvents: true,
+-              ...(params.incognito ? { ephemeral: true } : {}),
+-            },
+-            requestOptions(),
++          startedThread = assertCodexThreadStartResponse(
++            await client.request(
++              "thread/start",
++              {
++                ...request,
++                developerInstructions: CODEX_CONVERSATION_THREAD_DEVELOPER_INSTRUCTIONS,
++                experimentalRawEvents: true,
++                ...(params.incognito ? { ephemeral: true } : {}),
++              },
++              requestOptions(),
++            ),
+           );
++          response = startedThread;
++        }
++        if (startedThread && resolved.planMode !== undefined) {
++          try {
++            await updateCodexFreshThreadSettings({
++              client,
++              threadId: startedThread.thread.id,
++              mode: resolved.planMode ? "plan" : "default",
++              model: startedThread.model,
++              reasoningEffort: startedThread.reasoningEffort,
++              requestOptions: requestOptions(),
++            });
++          } catch (error) {
++            const released = await unsubscribeCodexThreadBestEffort(client, {
++              threadId: startedThread.thread.id,
++              timeoutMs: CODEX_APP_SERVER_UNSUBSCRIBE_TIMEOUT_MS,
++            }).catch(() => false);
++            if (!released) {
++              await retireUnsafeCodexTurnClientBestEffort(
++                client,
++                "fresh thread native settings update",
++              );
++            }
++            throw error;
++          }
+         }
+         await writeThreadBindingFromResponse(params, resolved, client, response, requestOptions);
+       },
+@@ -638,6 +678,15 @@ async function projectConversationSourceHistory(
+   }
+ }
+ 
++/** A conversation mode toggle preserves every known native setting field. */
++export function resolveCodexConversationPlanModeSettings(params: {
++  planMode: boolean | undefined;
++  nativeSettings: CodexNativeCollaborationMode | undefined;
++  selectedModel?: string;
++}): CodexNativeCollaborationMode | undefined {
++  return resolveCodexNativeCollaborationMode(params);
++}
++
+ export function resolveModelBackedReviewerPolicyProvider(params: {
+   authProfileId?: string;
+   modelProvider?: string;
+diff --git a/extensions/codex/src/conversation-binding.ts b/extensions/codex/src/conversation-binding.ts
+index c50b380286e..58c7c92fff2 100644
+--- a/extensions/codex/src/conversation-binding.ts
++++ b/extensions/codex/src/conversation-binding.ts
+@@ -13,6 +13,7 @@ import { normalizeCodexAppServerBindingModelProvider } from "./app-server/auth-p
+ import {
+   consumeCodexAppServerLiveThread,
+   isCodexAppServerClientRuntimeLive,
++  readCodexNativeThreadSettings,
+ } from "./app-server/client-runtime.js";
+ import type { CodexAppServerLiveThreadOwnership } from "./app-server/client-thread-owner.js";
+ import {
+@@ -26,7 +27,7 @@ import {
+   assertCodexThreadStartResponse,
+   CodexThreadDirectInputError,
+ } from "./app-server/protocol-validators.js";
+-import type { CodexTurnStartResponse } from "./app-server/protocol.js";
++import type { CodexThreadResumeParams, CodexTurnStartResponse } from "./app-server/protocol.js";
+ import {
+   assertCodexBindingMayBeReplaced,
+   type CodexAppServerBindingStore,
+@@ -42,6 +43,7 @@ import {
+   CODEX_NATIVE_PERSONALITY_NONE,
+   resolveCodexAppServerRequestModelSelection,
+ } from "./app-server/thread-lifecycle.js";
++import { updateCodexFreshThreadSettings } from "./app-server/thread-native-settings.js";
+ import {
+   isSameCodexAppServerThreadOwner,
+   releaseCodexAppServerBindingSubscription,
+@@ -59,6 +61,7 @@ import {
+   buildConversationThreadRequestForClient,
+   CODEX_CONVERSATION_THREAD_DEVELOPER_INSTRUCTIONS,
+   prepareCodexConversationBinding,
++  resolveCodexConversationPlanModeSettings,
+   resolveConversationAppServerRuntime,
+   resolveModelBackedReviewerPolicyProvider,
+   type CodexConversationConfig,
+@@ -116,7 +119,7 @@ async function runBoundTurn(params: {
+         modelProvider: binding.modelProvider,
+         ...agentLookup,
+       });
+-      const { runtime, workspaceDir } = await resolveConversationAppServerRuntime({
++      const { runtime, workspaceDir, planMode } = await resolveConversationAppServerRuntime({
+         pluginConfig: params.pluginConfig,
+         config: params.config,
+         agentId: params.data.source?.agentId ?? params.data.agentId,
+@@ -147,7 +150,7 @@ async function runBoundTurn(params: {
+             ...agentLookup,
+           })
+         : undefined;
+-      const threadRequestRuntime = { runtime, workspaceDir, ...modelSelection };
++      const threadRequestRuntime = { runtime, workspaceDir, planMode, ...modelSelection };
+ 
+       const clientOptions = {
+         startOptions: runtime.start,
+@@ -171,18 +174,26 @@ async function runBoundTurn(params: {
+         | undefined;
+       let ownsNativeSubscription = false;
+       let turnSucceeded = false;
+-      const assertResumeInputAllowed = async () => {
++      const assertResumeInputAllowed = async (requireIdleForPlanSettings = false) => {
+         const { thread } = await client.request(
+           "thread/read",
+           { threadId, includeTurns: false },
+           { timeoutMs: runtime.requestTimeoutMs },
+         );
+         assertCodexThreadAcceptsDirectInput(thread);
++        if (requireIdleForPlanSettings && thread.status?.type !== "idle") {
++          throw new Error(
++            "Cannot read native Codex Plan settings while the thread is active; wait for it to become idle.",
++          );
++        }
+       };
+       try {
++        const planSettingsReadbackRequired =
++          planMode !== undefined && !readCodexNativeThreadSettings(client, threadId);
++        let planSettingsReadbackPerformed = false;
+         if (!networkProxyBindingChanged && binding.clientId !== client.getInstanceId()) {
+           // A new client may already retain this parent's child; check before claiming it.
+-          await assertResumeInputAllowed();
++          await assertResumeInputAllowed(planSettingsReadbackRequired);
+         }
+         if (!params.incognito && isCodexAppServerClientRuntimeLive(client)) {
+           const ownership = await consumeCodexAppServerLiveThread(client, threadId);
+@@ -203,7 +214,7 @@ async function runBoundTurn(params: {
+                   serviceTier,
+                   requestOptions,
+                 );
+-                return await requestClient.request(
++                const started = await requestClient.request(
+                   "thread/start",
+                   {
+                     ...threadRequest,
+@@ -213,6 +224,23 @@ async function runBoundTurn(params: {
+                   },
+                   requestOptions(),
+                 );
++                const startedThread = assertCodexThreadStartResponse(started);
++                threadId = startedThread.thread.id;
++                ownsNativeSubscription = true;
++                const targetMode =
++                  planMode === undefined ? undefined : planMode ? "plan" : "default";
++                const nativeSettings = readCodexNativeThreadSettings(requestClient, threadId);
++                if (targetMode && (!nativeSettings || nativeSettings.mode !== targetMode)) {
++                  await updateCodexFreshThreadSettings({
++                    client: requestClient,
++                    threadId,
++                    mode: targetMode,
++                    model: startedThread.model,
++                    reasoningEffort: startedThread.reasoningEffort,
++                    requestOptions: requestOptions(),
++                  });
++                }
++                return startedThread;
+               },
+               onClientChange: (nextClient) => {
+                 client = nextClient;
+@@ -279,22 +307,59 @@ async function runBoundTurn(params: {
+           useStickyNetworkProfile = runtime.networkProxy !== undefined;
+         } else if (
+           binding.clientId !== client.getInstanceId() ||
+-          (isCodexAppServerClientRuntimeLive(client) && !params.incognito && !liveThreadOwnership)
++          (isCodexAppServerClientRuntimeLive(client) &&
++            !params.incognito &&
++            !liveThreadOwnership) ||
++          planSettingsReadbackRequired
+         ) {
+-          if (binding.clientId === client.getInstanceId()) {
++          if (binding.clientId === client.getInstanceId() && !planSettingsReadbackRequired) {
+             await assertResumeInputAllowed();
+           }
+           const response = await withLeasedCodexAppServerClientStartSelectionRetry({
+             lease: clientLease,
+             options: clientOptions,
+             run: async (requestClient, requestOptions) => {
+-              const threadRequest = await buildConversationThreadRequestForClient(
+-                requestClient,
+-                threadRequestRuntime,
+-                serviceTier,
+-                requestOptions,
+-              );
+-              return await resumeCodexAppServerThread({
++              const needsPlanSettingsReadback =
++                planMode !== undefined && !readCodexNativeThreadSettings(requestClient, threadId);
++              let resumeRequest: CodexThreadResumeParams;
++              if (needsPlanSettingsReadback) {
++                const { thread } = await requestClient.request(
++                  "thread/read",
++                  { threadId, includeTurns: false },
++                  requestOptions(),
++                );
++                assertCodexThreadAcceptsDirectInput(thread);
++                if (thread.status?.type !== "idle") {
++                  throw new Error(
++                    "Cannot read native Codex Plan settings while the thread is active; wait for it to become idle.",
++                  );
++                }
++                if (
++                  liveThreadOwnership?.client === requestClient &&
++                  liveThreadOwnership.threadId === threadId
++                ) {
++                  await liveThreadOwnership.ownership.release(threadId);
++                  liveThreadOwnership = undefined;
++                  ownsNativeSubscription = false;
++                }
++                resumeRequest = {
++                  threadId,
++                  initialTurnsPage: {
++                    limit: 1,
++                    sortDirection: "desc",
++                    itemsView: "notLoaded",
++                  },
++                };
++              } else {
++                const threadRequest = await buildConversationThreadRequestForClient(
++                  requestClient,
++                  threadRequestRuntime,
++                  serviceTier,
++                  requestOptions,
++                );
++                resumeRequest = { ...threadRequest, threadId };
++              }
++              const resumed = await resumeCodexAppServerThread({
+                 client: requestClient,
+                 onSubscriptionReleased: () => {
+                   isolatedSubscriptionClient = requestClient;
+@@ -303,13 +368,15 @@ async function runBoundTurn(params: {
+                   await closeCodexStartupClientBestEffort(requestClient);
+                   isolatedSubscriptionClient = requestClient;
+                 },
+-                request: {
+-                  threadId,
+-                  ...threadRequest,
+-                },
++                request: resumeRequest,
++                assertCurrent: () => requestOptions().assertCurrent(),
+                 requestResume: (request) =>
+                   requestClient.request("thread/resume", request, requestOptions()),
+               });
++              if (needsPlanSettingsReadback) {
++                planSettingsReadbackPerformed = true;
++              }
++              return resumed;
+             },
+             onClientChange: (nextClient) => {
+               client = nextClient;
+@@ -318,6 +385,11 @@ async function runBoundTurn(params: {
+           threadId = response.thread.id;
+           ownsNativeSubscription = true;
+           assertCodexThreadAcceptsDirectInput(response.thread);
++          if (planSettingsReadbackPerformed && response.thread.status?.type !== "idle") {
++            throw new Error(
++              "Cannot change native Codex Plan mode while the thread is active; wait for it to become idle.",
++            );
++          }
+           if (
+             !isSameCodexAppServerThreadOwner(binding, {
+               threadId,
+@@ -357,6 +429,12 @@ async function runBoundTurn(params: {
+         // The client denies unclaimed approvals and dynamic tools. Its keyed router owns
+         // pre-bind buffering so this conversation cannot claim sibling turn requests.
+         turnRoute.armTurn();
++        const collaborationMode = resolveCodexConversationPlanModeSettings({
++          planMode,
++          nativeSettings:
++            planMode === undefined ? undefined : readCodexNativeThreadSettings(client, threadId),
++          selectedModel: modelSelection?.model,
++        });
+         const response: CodexTurnStartResponse = await client.request(
+           "turn/start",
+           {
+@@ -375,6 +453,7 @@ async function runBoundTurn(params: {
+                   sandboxPolicy: codexSandboxPolicyForTurn(sandbox, sessionRoot ?? workspaceDir),
+                 }),
+             ...(modelSelection?.model ? { model: modelSelection.model } : {}),
++            ...(collaborationMode ? { collaborationMode } : {}),
+             personality: CODEX_NATIVE_PERSONALITY_NONE,
+             ...(serviceTier ? { serviceTier } : {}),
+           },
+diff --git a/packages/gateway-protocol/src/schema/sessions-patch.test.ts b/packages/gateway-protocol/src/schema/sessions-patch.test.ts
+index f1ee9ac6686..9b41f883e76 100644
+--- a/packages/gateway-protocol/src/schema/sessions-patch.test.ts
++++ b/packages/gateway-protocol/src/schema/sessions-patch.test.ts
+@@ -69,6 +69,8 @@ describe("session patch schema", () => {
+         key: "agent:main:settings-cas",
+         expectedPermissionMode: "guarded",
+         permissionMode: "workspace",
++        expectedPlanMode: false,
++        planMode: true,
+         expectedToolOverrides: { webSearch: false },
+         toolOverrides: { skills: { release: false } },
+       }),
+@@ -80,6 +82,9 @@ describe("session patch schema", () => {
+         toolOverrides: null,
+       }),
+     ).toBe(false);
++    expect(validateSessionsPatchParams({ key: "agent:main:settings-cas", planMode: "on" })).toBe(
++      false,
++    );
+   });
+ 
+   it("validates lifecycle and unread acknowledgement identities", () => {
+diff --git a/packages/gateway-protocol/src/schema/sessions-patch.ts b/packages/gateway-protocol/src/schema/sessions-patch.ts
+index 545e77a3fd6..2e8b358836a 100644
+--- a/packages/gateway-protocol/src/schema/sessions-patch.ts
++++ b/packages/gateway-protocol/src/schema/sessions-patch.ts
+@@ -76,6 +76,8 @@ const SessionsPatchMutationProperties = {
+   execAsk: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),
+   execNode: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),
+   permissionMode: Type.Optional(Type.Union([SessionPermissionModeSchema, Type.Null()])),
++  /** Persist whether this session starts turns in Plan mode. */
++  planMode: Type.Optional(Type.Boolean()),
+   /** Null restores configured containment; required session isolation cannot be relaxed. */
+   sandboxMode: Type.Optional(Type.Union([Type.Literal("off"), Type.Null()])),
+   nativeRuntimeConsent: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),
+@@ -100,6 +102,8 @@ export const SessionsPatchParamsSchema = closedObject({
+   expectedSessionId: Type.Optional(NonEmptyString),
+   expectedLifecycleRevision: Type.Optional(NonEmptyString),
+   expectedPermissionMode: Type.Optional(Type.Union([SessionPermissionModeSchema, Type.Null()])),
++  /** Reject the mutation if the session Plan-mode setting changed before commit. */
++  expectedPlanMode: Type.Optional(Type.Boolean()),
+   expectedSandboxMode: Type.Optional(Type.Union([Type.Literal("off"), Type.Null()])),
+   expectedNativeRuntimeConsent: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),
+   expectedToolOverrides: Type.Optional(
+diff --git a/packages/gateway-protocol/src/schema/sessions-row.test.ts b/packages/gateway-protocol/src/schema/sessions-row.test.ts
+index 9fba1cf8784..46210a7e30d 100644
+--- a/packages/gateway-protocol/src/schema/sessions-row.test.ts
++++ b/packages/gateway-protocol/src/schema/sessions-row.test.ts
+@@ -38,6 +38,7 @@ describe("SessionRowSchema", () => {
+       sharingRole: "owner",
+       restartRecoveryStatus: "tombstoned",
+       permissionMode: "workspace",
++      planMode: true,
+       sandboxMode: "off",
+       sessionRoot: "/workspace/project",
+     };
+@@ -98,6 +99,7 @@ describe("SessionRowSchema", () => {
+       sharingRole: "owner",
+       restartRecoveryStatus: "tombstoned",
+       permissionMode: "workspace",
++      planMode: true,
+       sessionRoot: "/workspace/project",
+     });
+     expect(Value.Check(SessionRowSchema, { ...roundTripped, permissionMode: "unrestricted" })).toBe(
+diff --git a/packages/gateway-protocol/src/schema/sessions-row.ts b/packages/gateway-protocol/src/schema/sessions-row.ts
+index 46205414317..215615ef219 100644
+--- a/packages/gateway-protocol/src/schema/sessions-row.ts
++++ b/packages/gateway-protocol/src/schema/sessions-row.ts
+@@ -208,6 +208,8 @@ export const SessionRowSchema = Type.Object(
+     /** Persisted task cwd or spawned workspace; no filesystem resolution is implied. */
+     workspaceDir: Type.Optional(Type.String()),
+     permissionMode: Type.Optional(SessionPermissionModeSchema),
++    /** Persisted OpenClaw Plan override; omission preserves a native harness mode. */
++    planMode: Type.Optional(Type.Boolean()),
+     /** Authorized per-chat containment opt-out; omission follows configured sandbox policy. */
+     sandboxMode: Type.Optional(Type.Literal("off")),
+     /** Administrator consent to the exact external runtime's own permissions for this incarnation. */
+diff --git a/src/agents/embedded-agent-runner/run/attempt-tool-prepare.ts b/src/agents/embedded-agent-runner/run/attempt-tool-prepare.ts
+index b0528c507a4..fd998caa0b7 100644
+--- a/src/agents/embedded-agent-runner/run/attempt-tool-prepare.ts
++++ b/src/agents/embedded-agent-runner/run/attempt-tool-prepare.ts
+@@ -37,6 +37,7 @@ import { resolveModelAuthMode } from "../../model-auth.js";
+ import { supportsModelTools } from "../../model-tool-support.js";
+ import { recordAgentCleanupFailure, runOwnedAgentCleanup } from "../../run-cleanup-timeout.js";
+ import { resolveSessionPlacementComputer } from "../../session-placement-computer.js";
++import { resolveCoreSessionPlanModePermissionMode } from "../../session-plan-mode.js";
+ import {
+   resolveSessionPermissionExecMode,
+   type PreparedSessionPermissionPolicy,
+@@ -81,2 +81,15 @@ export async function prepareEmbeddedAttemptToolBase(params: {
+   const { attempt } = params;
++  if (attempt.planMode === true) {
++    const effectiveMode = resolveCoreSessionPlanModePermissionMode({
++      planMode: attempt.planMode,
++      permissionMode: attempt.permissionMode,
++    });
++    if (effectiveMode) {
++      attempt.permissionMode = effectiveMode;
++      attempt.execOverrides = {
++        ...attempt.execOverrides,
++        mode: resolveSessionPermissionExecMode({ mode: effectiveMode }),
++      };
++    }
++  }
+   const completionCheck = attempt.completionCheck;
+@@ -494,9 +508,15 @@ export async function prepareEmbeddedAttemptToolBase(params: {
+           params.runAbortController.signal,
+           toolAbortController.signal,
+         ]);
+-        attempt.permissionMode = mode ?? undefined;
++        const effectiveMode = resolveCoreSessionPlanModePermissionMode({
++          planMode: attempt.planMode,
++          permissionMode: mode,
++        });
++        attempt.permissionMode = effectiveMode;
+         attempt.execOverrides = { ...baseExecOverrides };
+-        const policy = mode ? { root: params.setup.sessionPermissionRoot, mode } : undefined;
++        const policy = effectiveMode
++          ? { root: params.setup.sessionPermissionRoot, mode: effectiveMode }
++          : undefined;
+         const nextTools = constructTools(policy, toolAbortSignal);
+         toolsRaw.splice(0, toolsRaw.length, ...nextTools);
+       },
+diff --git a/src/agents/embedded-agent-runner/run/params.ts b/src/agents/embedded-agent-runner/run/params.ts
+index 53eeec155b4..3e22c940bf4 100644
+--- a/src/agents/embedded-agent-runner/run/params.ts
++++ b/src/agents/embedded-agent-runner/run/params.ts
+@@ -150,6 +150,10 @@ export type RunEmbeddedAgentParams = {
+   /** Refuse an enabled sandbox that would redirect a review away from its workspace. */
+   requireWritableSandbox?: true;
+   permissionMode?: SessionEntry["permissionMode"];
++  /** Saved session authority before a per-run Plan-mode read-only clamp. */
++  storedPermissionMode?: SessionEntry["permissionMode"] | null;
++  /** Immutable per-run Plan-mode snapshot; saved session permissions remain untouched. */
++  planMode?: boolean;
+   sessionRoot?: string;
+   /** Context supplied by internal producers, separate from inbound prompt text. */
+   runtimeContextFragments?: import("../../internal-runtime-context.js").RuntimeContextFragment[];
+diff --git a/src/agents/embedded-agent-runner/run/run-attempt-dispatch.ts b/src/agents/embedded-agent-runner/run/run-attempt-dispatch.ts
+index 277aa0dc776..a08719b682b 100644
+--- a/src/agents/embedded-agent-runner/run/run-attempt-dispatch.ts
++++ b/src/agents/embedded-agent-runner/run/run-attempt-dispatch.ts
+@@ -18,6 +18,7 @@ import { buildAgentRuntimePlan } from "../../runtime-plan/build.js";
+ import { resolveSessionPermissionExecMode } from "../../session-permission-exec-mode.js";
+ import { resolveSessionPlacementSandbox } from "../../session-placement-admission.js";
+ import { resolveSessionSkillResourceSnapshot } from "../../session-placement-skill-resources.js";
++import { resolveSessionPlanModeAttemptFields } from "../../session-plan-mode.js";
+ import { createToolTerminalObserver } from "../../tool-terminal-outcome.js";
+ import {
+   resolveAttemptWorkspaceSandbox,
+@@ -443,6 +444,7 @@ export async function prepareAndDispatchEmbeddedRunAttempt(
+     ...resolveHarnessWorkspace(workspaceDir, params, pluginWorkspace, pluginSandbox),
+     bootstrapWorkspaceDir,
+     permissionMode: params.permissionMode,
++    ...resolveSessionPlanModeAttemptFields(params),
+     requireWorkspaceOnly: params.requireWorkspaceOnly,
+     requireWritableSandbox: params.requireWritableSandbox,
+     agentDir,
+diff --git a/src/config/sessions/types.ts b/src/config/sessions/types.ts
+index 42fcdd65c81..f3893601858 100644
+--- a/src/config/sessions/types.ts
++++ b/src/config/sessions/types.ts
+@@ -267,7 +267,10 @@ export type RestartRecoveryRun = {
+ 
+ type SessionEntryCore = SessionRestartRecoveryState &
+   SessionEntryProvenance &
+-  Pick<SessionRow, "permissionMode" | "sandboxMode" | "nativeRuntimeConsent" | "sessionRoot"> & {
++  Pick<
++    SessionRow,
++    "permissionMode" | "planMode" | "sandboxMode" | "nativeRuntimeConsent" | "sessionRoot"
++  > & {
+     /** Collaboration mode. Missing legacy values are equivalent to "shared". */
+     visibility?: NonNullable<SessionRow["visibility"]>;
+     /**
+diff --git a/src/gateway/server-methods/chat-send-admission.reads.test.ts b/src/gateway/server-methods/chat-send-admission.reads.test.ts
+index 17992b83ecc..d07c1cbb740 100644
+--- a/src/gateway/server-methods/chat-send-admission.reads.test.ts
++++ b/src/gateway/server-methods/chat-send-admission.reads.test.ts
+@@ -13,6 +13,7 @@ import { createDirectChatContext } from "../server-chat.agent-events.test-helper
+ import { pendingChatSendDedupeKey } from "../server-shared.js";
+ import { admitChatSend } from "./chat-send-admission.js";
+ import { normalizeChatSendRequest } from "./chat-send-request.js";
++import { captureAdmittedChatSendSessionSettings } from "./chat-send-session-settings.js";
+ import { prepareChatSendSession, qualifyChatSendSession } from "./chat-send-session.js";
+ 
+ it("loads fresh admission metadata once after preparing the session", async () => {
+@@ -27,6 +28,7 @@ it("loads fresh admission metadata once after preparing the session", async () =
+     const entry: SessionEntry = {
+       sessionId: "admission-session",
+       updatedAt: 1,
++      planMode: false,
+       skillsSnapshot: { prompt: "saved prompt".repeat(4096), skills: [] },
+     };
+     replaceSessionEntrySync(scope, entry);
+@@ -46,7 +48,12 @@ it("loads fresh admission metadata once after preparing the session", async () =
+     let admitted: Awaited<ReturnType<typeof admitChatSend>> | undefined;
+     try {
+       // Admission must read current settings even though preparation retained the old entry.
+-      replaceSessionEntrySync(scope, { ...entry, permissionMode: "full", updatedAt: 2 });
++      replaceSessionEntrySync(scope, {
++        ...entry,
++        permissionMode: "full",
++        planMode: true,
++        updatedAt: 2,
++      });
+       expect(session.entry?.permissionMode).toBeUndefined();
+       const sql = observeSqliteReadSql(StatementSync.prototype);
+       const respond = vi.fn();
+@@ -64,6 +71,7 @@ it("loads fresh admission metadata once after preparing the session", async () =
+           throw new Error("Session admission failed");
+         }
+         expect(admitted.value.admittedSessionSettings?.permissionMode).toBe("full");
++        expect(admitted.value.admittedSessionSettings?.planMode).toBe(true);
+         expect(admitted.value.admittedSessionId).toBe(entry.sessionId);
+         // Physical-source/absent-key guards may query keys without decoding entry metadata.
+         const metadataReads = sql.queries.filter(
+@@ -83,6 +91,30 @@ it("loads fresh admission metadata once after preparing the session", async () =
+   });
+ });
+ 
++it("rejects a chat send whose expected Plan mode no longer matches the session", () => {
++  expect(() =>
++    captureAdmittedChatSendSessionSettings({
++      commit: true,
++      entry: { sessionId: "plan-session", updatedAt: 1, planMode: true },
++      expectedPermissionMode: undefined,
++      expectedPlanMode: false,
++      expectedToolOverrides: undefined,
++    }),
++  ).toThrow("session-settings-changed");
++});
++
++it("keeps an unset Plan override unset in the admitted run snapshot", () => {
++  const admitted = captureAdmittedChatSendSessionSettings({
++    commit: true,
++    entry: { sessionId: "native-plan-session", updatedAt: 1 },
++    expectedPermissionMode: undefined,
++    expectedPlanMode: undefined,
++    expectedToolOverrides: undefined,
++  });
++
++  expect(admitted).not.toHaveProperty("planMode");
++});
++
+ it.each(["known-source", "new-terminal", "new-receipt"] as const)(
+   "refuses a conflicting or unprepared %s after admission waits",
+   async (source) => {
+diff --git a/src/gateway/server-methods/chat-send-admission.ts b/src/gateway/server-methods/chat-send-admission.ts
+index 62b8ca9e18a..3059d474f27 100644
+--- a/src/gateway/server-methods/chat-send-admission.ts
++++ b/src/gateway/server-methods/chat-send-admission.ts
+@@ -268,6 +268,7 @@ export async function admitChatSend(
+       commit: true,
+       entry: latestEntry,
+       expectedPermissionMode: p.expectedPermissionMode,
++      expectedPlanMode: p.expectedPlanMode,
+       expectedToolOverrides: p.expectedToolOverrides,
+     });
+     assertChatSendExclusiveAdmission(request, session);
+diff --git a/src/gateway/server-methods/chat-send-message-injection.ts b/src/gateway/server-methods/chat-send-message-injection.ts
+index d354d243bd0..d70b7c64730 100644
+--- a/src/gateway/server-methods/chat-send-message-injection.ts
++++ b/src/gateway/server-methods/chat-send-message-injection.ts
+@@ -4,6 +4,7 @@ import {
+ } from "@openclaw/normalization-core/string-coerce";
+ import { ErrorCodes, errorShape } from "../../../packages/gateway-protocol/src/index.js";
+ import type { AdmittedRunOperatorAuthority } from "../../agents/admitted-run-context.js";
++import { resolveCoreSessionPlanModePermissionMode } from "../../agents/session-plan-mode.js";
+ import { resolveCommandAuthorization } from "../../auto-reply/command-auth.js";
+ import { resolveEnvelopeFormatOptions } from "../../auto-reply/envelope.js";
+ import { buildInboundMediaNoteProjection } from "../../auto-reply/media-note.js";
+@@ -50,7 +51,9 @@ export function createChatSendMessageInjectionStarter(params: {
+     PreparedChatSendSession,
+     "cfg" | "entry" | "sessionKey" | "storePath" | "clientRunId"
+   >;
+-  admittedSessionSettings?: Readonly<Pick<SessionEntry, "permissionMode" | "toolOverrides">>;
++  admittedSessionSettings?: Readonly<
++    Pick<SessionEntry, "permissionMode" | "planMode" | "toolOverrides">
++  >;
+   turn: Pick<
+     Awaited<ReturnType<typeof prepareChatSendUserTurn>>,
+     "ctx" | "isInternalTextSlashCommandTurn" | "replyOptionImages" | "replyOptionMedia"
+@@ -196,7 +199,10 @@ export function createChatSendMessageInjectionStarter(params: {
+           ctx,
+           sessionEntry: {
+             spawnedBy: entry?.spawnedBy,
+-            permissionMode: params.admittedSessionSettings?.permissionMode,
++            permissionMode: resolveCoreSessionPlanModePermissionMode({
++              planMode: params.admittedSessionSettings?.planMode,
++              permissionMode: params.admittedSessionSettings?.permissionMode,
++            }),
+             toolOverrides: params.admittedSessionSettings?.toolOverrides,
+           },
+           senderIsOwner: authorization.senderIsOwner,
+diff --git a/src/gateway/server-methods/chat-send-pre-admission.ts b/src/gateway/server-methods/chat-send-pre-admission.ts
+index 85bafcec51f..a592d916789 100644
+--- a/src/gateway/server-methods/chat-send-pre-admission.ts
++++ b/src/gateway/server-methods/chat-send-pre-admission.ts
+@@ -635,6 +635,7 @@ export async function runChatSendPreAdmission(
+               commit: false,
+               entry: current.entry,
+               expectedPermissionMode: request.p.expectedPermissionMode,
++              expectedPlanMode: request.p.expectedPlanMode,
+               expectedToolOverrides: request.p.expectedToolOverrides,
+             });
+           },
+diff --git a/src/gateway/server-methods/chat-send-session-settings.ts b/src/gateway/server-methods/chat-send-session-settings.ts
+index 44293f9bd09..cb8ae6e7cd1 100644
+--- a/src/gateway/server-methods/chat-send-session-settings.ts
++++ b/src/gateway/server-methods/chat-send-session-settings.ts
+@@ -7,19 +7,21 @@ import type { NormalizedChatSendRequest } from "./chat-send-request.js";
+ 
+ export const SESSION_SETTINGS_CHANGED_ERROR_REASON = "session-settings-changed";
+ type AdmittedChatSendSessionSettings =
+-  | Readonly<Pick<SessionEntry, "permissionMode" | "toolOverrides">>
++  | Readonly<Pick<SessionEntry, "permissionMode" | "planMode" | "toolOverrides">>
+   | undefined;
+ 
+ export function captureAdmittedChatSendSessionSettings(params: {
+   commit: boolean;
+   entry: SessionEntry | undefined;
+   expectedPermissionMode: NormalizedChatSendRequest["p"]["expectedPermissionMode"];
++  expectedPlanMode: NormalizedChatSendRequest["p"]["expectedPlanMode"];
+   expectedToolOverrides: NormalizedChatSendRequest["p"]["expectedToolOverrides"];
+ }): AdmittedChatSendSessionSettings {
+-  const { entry, expectedPermissionMode, expectedToolOverrides } = params;
++  const { entry, expectedPermissionMode, expectedPlanMode, expectedToolOverrides } = params;
+   if (
+     (expectedPermissionMode !== undefined &&
+       (entry?.permissionMode ?? null) !== expectedPermissionMode) ||
++    (expectedPlanMode !== undefined && (entry?.planMode === true) !== expectedPlanMode) ||
+     (expectedToolOverrides !== undefined &&
+       !sessionToolOverridesEqual(entry?.toolOverrides, expectedToolOverrides))
+   ) {
+@@ -30,6 +32,7 @@ export function captureAdmittedChatSendSessionSettings(params: {
+   }
+   return Object.freeze({
+     permissionMode: entry?.permissionMode,
++    ...(entry?.planMode !== undefined ? { planMode: entry.planMode } : {}),
+     toolOverrides: normalizeSessionToolOverrides(entry?.toolOverrides),
+   });
+ }
+diff --git a/src/gateway/server-methods/sessions-patch-expectations.ts b/src/gateway/server-methods/sessions-patch-expectations.ts
+index 0f5ba17ba6d..ec52dd0df9b 100644
+--- a/src/gateway/server-methods/sessions-patch-expectations.ts
++++ b/src/gateway/server-methods/sessions-patch-expectations.ts
+@@ -32,6 +32,9 @@ export function resolveSessionPatchExpectationError(
+   if (patch.expectedPermissionMode !== undefined && patch.permissionMode === undefined) {
+     return "expectedPermissionMode requires a permissionMode replacement.";
+   }
++  if (patch.expectedPlanMode !== undefined && patch.planMode === undefined) {
++    return "expectedPlanMode requires a planMode replacement.";
++  }
+   if (
+     patch.expectedNativeRuntimeConsent !== undefined &&
+     patch.nativeRuntimeConsent === undefined
+@@ -75,6 +78,8 @@ export function resolveSessionPatchTargetError(
+       (entry?.sandboxMode ?? null) !== patch.expectedSandboxMode) ||
+     (patch.expectedPermissionMode !== undefined &&
+       (entry?.permissionMode ?? null) !== patch.expectedPermissionMode) ||
++    (patch.expectedPlanMode !== undefined &&
++      (entry?.planMode === true) !== patch.expectedPlanMode) ||
+     (patch.expectedNativeRuntimeConsent !== undefined &&
+       (entry?.nativeRuntimeConsent ?? null) !== patch.expectedNativeRuntimeConsent) ||
+     (patch.expectedToolOverrides !== undefined &&
+@@ -95,6 +100,7 @@ export function sessionPatchTargetIdentity(patch: SessionsPatchParams) {
+     ...(patch.expectedPermissionMode !== undefined
+       ? { expectedPermissionMode: patch.expectedPermissionMode }
+       : {}),
++    ...(patch.expectedPlanMode !== undefined ? { expectedPlanMode: patch.expectedPlanMode } : {}),
+     ...(patch.expectedSandboxMode !== undefined
+       ? { expectedSandboxMode: patch.expectedSandboxMode }
+       : {}),
+diff --git a/src/gateway/server.sessions.patch-expected-identity.test.ts b/src/gateway/server.sessions.patch-expected-identity.test.ts
+index 58a4691dd72..6d45b23b7a8 100644
+--- a/src/gateway/server.sessions.patch-expected-identity.test.ts
++++ b/src/gateway/server.sessions.patch-expected-identity.test.ts
+@@ -320,6 +320,52 @@ test("sessions.patch rejects stale permission replacement", async () => {
+   expect(loadSessionEntry({ sessionKey, storePath })?.permissionMode).toBe("read-only");
+ });
+ 
++test("sessions.patch reads back Plan mode and rejects a stale expected mode", async () => {
++  const { storePath } = await createSessionStoreDir();
++  const sessionKey = "agent:main:plan-mode-cas";
++  await writeSessionStore({
++    entries: {
++      [sessionKey]: sessionStoreEntry("plan-mode-cas", { planMode: false }),
++    },
++  });
++
++  const enabled = await directSessionReq("sessions.patch", {
++    key: sessionKey,
++    expectedPlanMode: false,
++    planMode: true,
++  });
++  expect(enabled.ok).toBe(true);
++  expect(loadSessionEntry({ sessionKey, storePath })?.planMode).toBe(true);
++
++  const listed = await directSessionReq<{ sessions: Array<{ key: string; planMode?: boolean }> }>(
++    "sessions.list",
++    { agentId: "main", limit: 100 },
++  );
++  expect(listed.payload?.sessions.find((row) => row.key === sessionKey)?.planMode).toBe(true);
++
++  const stale = await directSessionReq("sessions.patch", {
++    key: sessionKey,
++    expectedPlanMode: false,
++    planMode: false,
++  });
++  expect(stale).toMatchObject({
++    ok: false,
++    error: { details: { reason: "session-changed" } },
++  });
++  expect(loadSessionEntry({ sessionKey, storePath })?.planMode).toBe(true);
++
++  const missingReplacement = await directSessionReq("sessions.patch", {
++    key: sessionKey,
++    expectedPlanMode: true,
++    label: "unguarded mode update",
++  });
++  expect(missingReplacement).toMatchObject({
++    ok: false,
++    error: { message: "expectedPlanMode requires a planMode replacement." },
++  });
++  expect(loadSessionEntry({ sessionKey, storePath })).not.toHaveProperty("label");
++});
++
+ test("sessions.patch rejects automatic acknowledgement with another mutation", async () => {
+   const { storePath } = await createSessionStoreDir();
+   const sessionKey = "agent:main:conditional-unread-label";
+diff --git a/src/gateway/session-utils-row.ts b/src/gateway/session-utils-row.ts
+index 4fa4498da29..6bf994d8aab 100644
+--- a/src/gateway/session-utils-row.ts
++++ b/src/gateway/session-utils-row.ts
+@@ -459,6 +459,7 @@ export function materializeSessionRow(input: ReturnType<typeof readSessionRowInp
+     workspaceDir: entry?.spawnedCwd ?? entry?.spawnedWorkspaceDir,
+     projectId: entry?.projectId,
+     permissionMode: entry?.permissionMode,
++    ...(entry?.planMode !== undefined ? { planMode: entry.planMode } : {}),
+     sandboxMode: entry?.sandboxMode,
+     nativeRuntimeConsent: entry?.nativeRuntimeConsent,
+     permissionModePending: input.permissionModePending,
+diff --git a/src/gateway/sessions-patch.ts b/src/gateway/sessions-patch.ts
+index f100cfc3815..bdeaaf1d52e 100644
+--- a/src/gateway/sessions-patch.ts
++++ b/src/gateway/sessions-patch.ts
+@@ -388,6 +388,9 @@ function* projectSessionPatchSteps(
+       return { ok: false, error: protectedError };
+     }
+   }
++  if (patch.planMode !== undefined) {
++    next.planMode = patch.planMode;
++  }
+   const lifecycleFlagsError = applySessionPatchLifecycleFlags({
+     patch,
+     next,
+diff --git a/src/plugin-sdk/control-ui.ts b/src/plugin-sdk/control-ui.ts
+index 3ad09645313..b413d21a4bc 100644
+--- a/src/plugin-sdk/control-ui.ts
++++ b/src/plugin-sdk/control-ui.ts
+@@ -18,6 +18,10 @@ export type ControlUiDisposer = () => void;
+ 
+ export type ControlUiConnection = {
+   connected: boolean;
++  /** Changes when the socket is stopped/replaced; absent on older hosts. */
++  generation?: number;
++  /** Server-issued socket identity; absent before the authenticated hello. */
++  id?: string;
+   canRead: boolean;
+   canWrite: boolean;
+   canGrant: boolean;
+@@ -92,6 +96,10 @@ export type ControlUiSurfaceProps = {
+     /** Resolves true on admission, false on rejection, or void for a local command/no submit. */
+     send: () => Promise<boolean | void>;
+     abort?: () => void;
++    /** Start dictation through this captured native composer; false means unavailable or stale. */
++    startDictation?: () => boolean;
++    /** Finish dictation through this captured native composer, including while the Gateway is offline. */
++    finishDictation?: () => Promise<boolean>;
+   };
+   workspace: BoardGetParams & { routeId: string };
+   transcript: BoardGetParams & {
+@@ -207,6 +215,10 @@ export type ControlUiHost = {
+   redact: (text: string) => string;
+   readonly connection: ControlUiConnection;
+   readonly components: ControlUiComponents;
++  /** Focus the owning window; false means the OS or browser declined the request. */
++  window?: { focus: () => Promise<boolean> };
++  /** Request an HTTP(S) link through the host; true means admitted, not external-page verification. */
++  links?: { openExternal: (url: string) => Promise<boolean> };
+   /**
+    * Native modules share the operator's authenticated Gateway authority.
+    * The Gateway enforces connection scopes, not a per-plugin RPC allowlist.
+diff --git a/src/shared/session-method-scopes-base.ts b/src/shared/session-method-scopes-base.ts
+index ee5dcb71ee6..04ae05321b2 100644
+--- a/src/shared/session-method-scopes-base.ts
++++ b/src/shared/session-method-scopes-base.ts
+@@ -97,6 +97,7 @@ const SESSIONS_PATCH_WRITE_SCOPE_MUTATIONS: ReadonlySet<string> = new Set([
+   "thinkingLevel",
+   "fastMode",
+   "permissionMode",
++  "planMode",
+ ]);
+ 
+ const SESSIONS_PATCH_WRITE_SCOPE_ENVELOPE_FIELDS: ReadonlySet<string> = new Set([
+@@ -105,6 +106,7 @@ const SESSIONS_PATCH_WRITE_SCOPE_ENVELOPE_FIELDS: ReadonlySet<string> = new Set(
+   "expectedSessionId",
+   "expectedLifecycleRevision",
+   "expectedPermissionMode",
++  "expectedPlanMode",
+   "expectedMarkedUnreadAt",
+ ]);
+ 
+diff --git a/src/shared/session-method-scopes.test.ts b/src/shared/session-method-scopes.test.ts
+index 8d41908c377..977447ba5d3 100644
+--- a/src/shared/session-method-scopes.test.ts
++++ b/src/shared/session-method-scopes.test.ts
+@@ -79,6 +79,10 @@ describe("resolveDynamicSessionMutationRequiredScope", () => {
+         expectedLifecycleRevision: "revision-1",
+       },
+     },
++    {
++      name: "plan mode CAS envelope",
++      patch: { planMode: true, expectedPlanMode: false },
++    },
+     { name: "automatic read envelope", patch: { expectedMarkedUnreadAt: 10 } },
+   ])("keeps $name write-scoped", ({ patch }) => {
+     expect(
+@@ -179,6 +183,7 @@ describe("resolveDynamicSessionMutationRequiredScope", () => {
+           model: "openai/gpt-5.6-luna",
+           thinkingLevel: "high",
+           fastMode: "auto",
++          planMode: true,
+         },
+       }),
+     ).toBe("operator.write");
+diff --git a/ui/src/pages/chat/chat-view.ts b/ui/src/pages/chat/chat-view.ts
+index 11dba31800f..2dbbb0e71df 100644
+--- a/ui/src/pages/chat/chat-view.ts
++++ b/ui/src/pages/chat/chat-view.ts
+@@ -455,16 +455,24 @@ export function renderChat(props: ChatProps) {
+     ...inputDisplay.queue,
+   ];
+   const composerProps = { ...props, displayQueue };
+-  const defaultComposer = renderChatComposer({
+-    ...props,
+-    asyncQuestions,
+-    displayQueue,
+-    footerContent,
+-    notices,
+-    onRequestUpdate: requestUpdate,
+-    onToggleRealtimeTalk: props.suggestionComposer ? undefined : props.onToggleRealtimeTalk,
+-    onOpenImage: openImmediateImage,
+-  });
++  let startNativeDictation: (() => boolean) | undefined;
++  let finishNativeDictation: (() => Promise<boolean>) | undefined;
++  const defaultComposer = renderChatComposer(
++    {
++      ...props,
++      asyncQuestions,
++      displayQueue,
++      footerContent,
++      notices,
++      onRequestUpdate: requestUpdate,
++      onToggleRealtimeTalk: props.suggestionComposer ? undefined : props.onToggleRealtimeTalk,
++      onOpenImage: openImmediateImage,
++    },
++    (controls) => {
++      startNativeDictation = controls?.start;
++      finishNativeDictation = controls?.finish;
++    },
++  );
+   const chatColumnFooter = renderPluginSurface(
+     "composer",
+     {
+@@ -477,6 +485,8 @@ export function renderChat(props: ChatProps) {
+       setDraft: props.onDraftChange,
+       send: async () => props.onSend(),
+       abort: props.onAbort,
++      startDictation: startNativeDictation,
++      finishDictation: finishNativeDictation,
+     },
+     defaultComposer,
+     props.presented ?? true,
+diff --git a/ui/src/pages/chat/components/chat-composer.ts b/ui/src/pages/chat/components/chat-composer.ts
+index 1a9bfa5f544..dcb992bf3a8 100644
+--- a/ui/src/pages/chat/components/chat-composer.ts
++++ b/ui/src/pages/chat/components/chat-composer.ts
+@@ -56,14 +56,28 @@ import {
+   markComposerInputIntent,
+   suppressStaleSubmittedDraftReplay,
+ } from "./chat-composer-state.ts";
+-import type { ChatComposerProps } from "./chat-composer-types.ts";
++import type { ChatComposerProps, ChatComposerState } from "./chat-composer-types.ts";
+ import { renderChatComposerView } from "./chat-composer-view.ts";
+ 
+ registerChatGoalsEnglish();
+ 
+ export { isChatRunWorking, resetChatComposerState } from "./chat-composer-state.ts";
+ 
+-export function renderChatComposer(props: ChatComposerProps) {
++type NativeDictationControls = { start: () => boolean; finish: () => Promise<boolean> };
++
++function captureDictationSelection(state: ChatComposerState, fallback: string) {
++  state.dictationSelection = {
++    start: state.composerTextarea?.selectionStart ?? fallback.length,
++    end: state.composerTextarea?.selectionEnd ?? fallback.length,
++    value: state.composerTextarea?.value ?? fallback,
++  };
++  state.composerTextarea?.setAttribute("readonly", "");
++}
++
++export function renderChatComposer(
++  props: ChatComposerProps,
++  onNativeDictationControls?: (controls: NativeDictationControls | null) => void,
++) {
+   const state = getChatComposerState(props.paneId);
+   state.slashCommandDispatchConnected = props.connected;
+   const canCompose = props.canCompose ?? props.canSend;
+@@ -561,23 +575,37 @@ export function renderChatComposer(props: ChatComposerProps) {
+     props.onToggleRealtimeTalk && props.composerHoldToRecord !== false
+       ? state.dictation
+       : undefined;
++  const isCapturedDictation = () =>
++    state.dictation === dictation && state.composerDraftScopeKey === draftKey;
++  onNativeDictationControls?.(
++    dictation
++      ? {
++          start: () => {
++            if (!isCapturedDictation()) {
++              return false;
++            }
++            state.dictationError = null;
++            captureDictationSelection(state, visibleDraft);
++            const started = dictation.startDirect();
++            if (!started) {
++              state.dictationSelection = null;
++              state.composerTextarea?.removeAttribute("readonly");
++              requestUpdate();
++            }
++            return started;
++          },
++          finish: () => (isCapturedDictation() ? dictation.finishActive() : Promise.resolve(false)),
++        }
++      : null,
++  );
+   const handleDictationPointerDown = (event: PointerEvent) => {
+     if (state.dictationError) {
+       state.dictationError = null;
+       requestUpdate();
+     }
+-    const target = state.composerTextarea;
+-    const selection = {
+-      start: target?.selectionStart ?? visibleDraft.length,
+-      end: target?.selectionEnd ?? visibleDraft.length,
+-      value: target?.value ?? visibleDraft,
+-    };
+     if (dictation?.handlePointerDown(event)) {
+       // Stop also emits pointerdown; only a new gesture owns a draft snapshot.
+-      state.dictationSelection = selection;
+-      if (target) {
+-        target.readOnly = true;
+-      }
++      captureDictationSelection(state, visibleDraft);
+     }
+   };
+   const runControlsProps: ChatRunControlsProps = {
+diff --git a/ui/src/plugins/control-ui-host.test.ts b/ui/src/plugins/control-ui-host.test.ts
+index b2ffa1ebe59..865f81d97d7 100644
+--- a/ui/src/plugins/control-ui-host.test.ts
++++ b/ui/src/plugins/control-ui-host.test.ts
+@@ -576,6 +576,7 @@ describe("native UI plugin panels", () => {
+     } as unknown as ApplicationContext;
+     const abort = new AbortController();
+     const owner = {
++      client: { connectionGeneration: 0 } as GatewayBrowserClient,
+       abort,
+       descriptor: { pluginId: "review" },
+       disposers: new Set(),
+diff --git a/ui/src/plugins/control-ui-host.ts b/ui/src/plugins/control-ui-host.ts
+index 120d043d9ac..73f867c6194 100644
+--- a/ui/src/plugins/control-ui-host.ts
++++ b/ui/src/plugins/control-ui-host.ts
+@@ -7,6 +7,7 @@ import type {
+ import { serializeSidebarEntry } from "../app-navigation.ts";
+ import { isRouteId, pathForRoute, pluginTabLocation } from "../app-route-paths.ts";
+ import type { ApplicationContext } from "../app/context.ts";
++import { focusControlUiWindow, openControlUiExternalLink } from "../app/native-window-focus.ts";
+ import { hasOperatorReadAccess, readGatewayOperatorAccess } from "../app/operator-access.ts";
+ import {
+   PLUGIN_PANEL_TOGGLE_EVENT,
+@@ -99,6 +100,10 @@ export function createControlUiPluginHost(
+       return i18n.getLocale();
+     },
+     redact: redactToolPayloadText,
++    window: { focus: () => call(() => focusControlUiWindow(owner.abort.signal)) },
++    links: {
++      openExternal: (url) => call(() => openControlUiExternalLink(url, owner.abort.signal)),
++    },
+     components: createControlUiComponents({
+       current,
+       signal: owner.abort.signal,
+@@ -109,6 +114,8 @@ export function createControlUiPluginHost(
+       const access = readGatewayOperatorAccess(snapshot);
+       return {
+         connected: snapshot.phase === "connected",
++        generation: owner.client.connectionGeneration,
++        id: snapshot.hello?.server?.connId,
+         canRead: hasOperatorReadAccess(snapshot.hello?.auth ?? null),
+         canWrite: access.canWrite,
+         canGrant: access.canGrantApprovals,
+diff --git a/ui/src/plugins/control-ui-scope.ts b/ui/src/plugins/control-ui-scope.ts
+index a8b1621a9fa..0271d56091e 100644
+--- a/ui/src/plugins/control-ui-scope.ts
++++ b/ui/src/plugins/control-ui-scope.ts
+@@ -123,6 +123,8 @@ export function scopeControlUiHost(host: ControlUiHost, signal: AbortSignal): Co
+     agents: services(host.agents),
+     navigation: services(host.navigation),
+     dock: host.dock ? services(host.dock) : undefined,
++    window: host.window ? services(host.window) : undefined,
++    links: host.links ? services(host.links) : undefined,
+     ui: services(host.ui),
+     components: services(host.components),
+   };
+diff --git a/apps/macos/Sources/OpenClaw/DashboardWindowFocusMessageHandler.swift b/apps/macos/Sources/OpenClaw/DashboardWindowFocusMessageHandler.swift
+new file mode 100644
+index 00000000000..3e77e67c249
+--- /dev/null
++++ b/apps/macos/Sources/OpenClaw/DashboardWindowFocusMessageHandler.swift
+@@ -0,0 +1,21 @@
++import Foundation
++import WebKit
++
++/// A current trusted dashboard may focus its own window, never another app or document.
++@MainActor
++final class DashboardWindowFocusMessageHandler: NSObject, WKScriptMessageHandlerWithReply {
++    static let name = "openclawWindowFocus"
++    weak var owner: DashboardWindowController?
++
++    func userContentController(
++        _: WKUserContentController,
++        didReceive message: WKScriptMessage,
++        replyHandler: @escaping @MainActor (Any?, String?) -> Void)
++    {
++        guard let owner else {
++            replyHandler(nil, "The dashboard window is no longer available.")
++            return
++        }
++        owner.receiveWindowFocusMessage(message, replyHandler: replyHandler)
++    }
++}
+diff --git a/extensions/codex/src/app-server/client-runtime-native-settings.test.ts b/extensions/codex/src/app-server/client-runtime-native-settings.test.ts
+new file mode 100644
+index 00000000000..90ca0905eb6
+--- /dev/null
++++ b/extensions/codex/src/app-server/client-runtime-native-settings.test.ts
+@@ -0,0 +1,93 @@
++import { expect, it, vi } from "vitest";
++import {
++  ensureCodexAppServerClientRuntime,
++  readCodexNativeThreadSettings,
++  recordCodexNativeThreadSettings,
++} from "./client-runtime.js";
++import { createClientHarness } from "./test-support.js";
++
++it("tracks complete thread settings through notifications and clears them on retirement", async () => {
++  const harness = createClientHarness();
++  const initial = {
++    mode: "default",
++    settings: {
++      model: "native-model",
++      reasoning_effort: "high",
++      developer_instructions: "Keep native instructions.",
++    },
++  } as const;
++  try {
++    ensureCodexAppServerClientRuntime(harness.client, { agentDir: "/tmp/agent" });
++    expect(recordCodexNativeThreadSettings(harness.client, "native-thread", initial)).toBe(true);
++    expect(readCodexNativeThreadSettings(harness.client, "native-thread")).toEqual(initial);
++
++    harness.send({
++      method: "thread/settings/updated",
++      params: {
++        threadId: "native-thread",
++        threadSettings: { collaborationMode: { ...initial, mode: "plan" } },
++      },
++    });
++    await vi.waitFor(() =>
++      expect(readCodexNativeThreadSettings(harness.client, "native-thread")?.mode).toBe("plan"),
++    );
++
++    harness.send({
++      method: "thread/settings/updated",
++      params: {
++        threadId: "native-thread",
++        threadSettings: { collaborationMode: { mode: "default", settings: { model: 3 } } },
++      },
++    });
++    await vi.waitFor(() =>
++      expect(readCodexNativeThreadSettings(harness.client, "native-thread")).toBeUndefined(),
++    );
++
++    expect(recordCodexNativeThreadSettings(harness.client, "native-thread", initial)).toBe(true);
++    harness.send({ method: "thread/archived", params: { threadId: "native-thread" } });
++    await vi.waitFor(() =>
++      expect(readCodexNativeThreadSettings(harness.client, "native-thread")).toBeUndefined(),
++    );
++  } finally {
++    harness.client.close();
++  }
++  expect(readCodexNativeThreadSettings(harness.client, "native-thread")).toBeUndefined();
++});
++
++it("retains settings across a same-build module copy and invalidates them on client close", async () => {
++  const harness = createClientHarness();
++  const initial = {
++    mode: "plan",
++    settings: {
++      model: "native-model",
++      reasoning_effort: "high",
++      developer_instructions: "Keep native instructions.",
++    },
++  } as const;
++  const addNotificationHandler = vi.spyOn(harness.client, "addNotificationHandler");
++  const addCloseHandler = vi.spyOn(harness.client, "addCloseHandler");
++  try {
++    ensureCodexAppServerClientRuntime(harness.client, { agentDir: "/tmp/agent" });
++    expect(recordCodexNativeThreadSettings(harness.client, "native-thread", initial)).toBe(true);
++
++    vi.resetModules();
++    const [runtimeCopy, settingsCopy] = await Promise.all([
++      import("./client-runtime.js"),
++      import("./thread-native-settings.js"),
++    ]);
++    runtimeCopy.ensureCodexAppServerClientRuntime(harness.client, { agentDir: "/tmp/agent" });
++    settingsCopy.openCodexNativeThreadSettings(harness.client);
++
++    expect(settingsCopy.readCodexNativeThreadSettings(harness.client, "native-thread")).toEqual(
++      initial,
++    );
++    expect(addNotificationHandler).toHaveBeenCalledTimes(2);
++    expect(addCloseHandler).toHaveBeenCalledTimes(2);
++  } finally {
++    harness.client.close();
++  }
++  const settingsCopy = await import("./thread-native-settings.js");
++  expect(
++    settingsCopy.readCodexNativeThreadSettings(harness.client, "native-thread"),
++  ).toBeUndefined();
++});
+diff --git a/extensions/codex/src/app-server/run-attempt-native-settings.test.ts b/extensions/codex/src/app-server/run-attempt-native-settings.test.ts
+new file mode 100644
+index 00000000000..cae806798a9
+--- /dev/null
++++ b/extensions/codex/src/app-server/run-attempt-native-settings.test.ts
+@@ -0,0 +1,173 @@
++import { describe, expect, it, vi } from "vitest";
++import { prepareCodexAttemptTurnRequest } from "./run-attempt-turn-request.js";
++import type { CodexNativeCollaborationMode } from "./thread-native-settings.js";
++
++const native = vi.hoisted(() => ({
++  cached: undefined as unknown,
++  requested: undefined as unknown,
++  record: vi.fn(),
++}));
++
++vi.mock("openclaw/plugin-sdk/agent-harness-runtime", () => ({
++  embeddedAgentLog: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
++  formatErrorMessage: String,
++}));
++vi.mock("./attempt-client-cleanup.js", () => ({
++  interruptCodexTurnAndWaitBestEffort: vi.fn(async () => true),
++  retireUnsafeCodexTurnClientBestEffort: vi.fn(async () => undefined),
++}));
++vi.mock("./attempt-diagnostics.js", () => ({
++  createCodexModelCallDiagnosticEmitter: () => ({ setRequestPayloadBytes: vi.fn() }),
++  utf8JsonByteLength: () => 1,
++}));
++vi.mock("./binding-connection.js", () => ({
++  assertCodexSessionRuntimeOwnership: vi.fn(),
++  requireCodexSupervisionModelSelection: vi.fn(),
++}));
++vi.mock("./client-runtime.js", () => ({
++  prepareCodexWorkspaceReferences: () => ({ include: false, accepted: vi.fn() }),
++  readCodexNativeThreadSettings: () => native.cached as CodexNativeCollaborationMode | undefined,
++  recordCodexNativeThreadSettings: (_client: unknown, _threadId: string, settings: unknown) => {
++    native.record(settings);
++    native.cached = settings;
++    return true;
++  },
++}));
++vi.mock("./client.js", () => ({
++  isCodexAppServerIndeterminateRequestCancellationError: () => false,
++}));
++vi.mock("./developer-instruction-sections.js", () => ({ joinPresentSections: () => "" }));
++vi.mock("./explicit-skill-input.js", () => ({ resolveCodexExplicitSkillInputs: async () => [] }));
++vi.mock("./inference-routing.js", () => ({ getCodexInferenceThread: () => undefined }));
++vi.mock("./model-runtime.js", () => ({ readCodexRuntimeModelId: () => "test-model" }));
++vi.mock("./protocol-validators.js", () => ({
++  assertCodexTurnStartResponse: (response: unknown) => response,
++}));
++vi.mock("./provider-review-continuation.js", () => ({
++  prepareCodexProviderReviewContinuation: async () => undefined,
++}));
++vi.mock("./rate-limit-cache.js", () => ({ readCodexRateLimitsRevision: () => 0 }));
++vi.mock("./run-attempt-lifecycle.js", () => ({
++  emitCodexAppServerEvent: vi.fn(),
++  withCodexAppServerFastModeServiceTier: (value: unknown) => value,
++}));
++vi.mock("./service-tier.js", () => ({ resolveCodexUltrafastServiceTier: async () => undefined }));
++vi.mock("./thread-lifecycle.js", () => ({
++  buildTurnStartParams: (_params: unknown, options: { threadId: string; promptText: string }) => ({
++    threadId: options.threadId,
++    input: [{ type: "text", text: options.promptText, text_elements: [] }],
++    collaborationMode: native.requested,
++  }),
++}));
++vi.mock("./trajectory.js", () => ({ recordCodexTrajectoryContext: vi.fn() }));
++vi.mock("./turn-params.js", () => ({ buildCodexParentLocalInstructions: vi.fn() }));
++vi.mock("./user-prompt-message.js", () => ({ buildCodexUserPromptMessage: vi.fn() }));
++
++describe("native settings readback ordering", () => {
++  it("keeps a settings notification that arrives before the turn/start acknowledgement", async () => {
++    const requested = {
++      mode: "plan",
++      settings: {
++        model: "test-model",
++        reasoning_effort: null,
++        developer_instructions: null,
++      },
++    } as const;
++    const effective = {
++      mode: "plan",
++      settings: {
++        model: "test-model",
++        reasoning_effort: null,
++        developer_instructions: "Native Plan instructions normalized by Codex.",
++      },
++    } as const;
++    native.cached = undefined;
++    native.requested = requested;
++    native.record.mockReset();
++
++    const recordCodexNativeThreadSettings = (
++      _client: unknown,
++      _threadId: string,
++      settings: unknown,
++    ) => {
++      native.record(settings);
++      native.cached = settings;
++      return true;
++    };
++    let observedRequest: Record<string, unknown> | undefined;
++    const client = {
++      request: vi.fn(async (method: string, payload: Record<string, unknown>) => {
++        if (method !== "turn/start") {
++          throw new Error(`Unexpected native request: ${method}`);
++        }
++        observedRequest = payload;
++        // The native server emits its normalized settings before returning the
++        // acknowledgement for the request that caused the update.
++        recordCodexNativeThreadSettings(client, "thread-1", effective);
++        return { turn: { id: "turn-1", status: "inProgress", items: [] } };
++      }),
++    };
++    const liveThreadOwnership = { assertCurrent: vi.fn() };
++    const turnState = { codexTurnPromptText: "synthetic input" };
++    const resources = {
++      state: {
++        client,
++        thread: {
++          threadId: "thread-1",
++          lifecycle: { action: "resumed" },
++          connectionScope: "managed",
++          modelProvider: "openai",
++          model: "test-model",
++          liveThreadOwnership,
++        },
++        codexExecutionCwd: "/synthetic/workspace",
++      },
++      nativeProcessAuthority: { bindTurn: vi.fn() },
++      prompt: {
++        turnState,
++        contextImageGroups: [],
++        buildRenderedCodexDeveloperInstructions: () => "synthetic developer instructions",
++        refreshWorkspaceReferences: vi.fn(),
++        context: {
++          workspaceBootstrapContext: {},
++          attemptTools: { tools: [], toolBridge: { availableTools: [], availableSpecs: [] } },
++          runtime: {
++            runtimeParams: { model: { api: "openai-chatgpt-responses" } },
++            effectiveRuntimeProviderId: "openai",
++            effectiveRuntimeModelId: "test-model",
++            connection: {
++              params: {
++                runId: "run-1",
++                sessionId: "session-1",
++                provider: "openai",
++                modelId: "test-model",
++                model: { api: "openai-chatgpt-responses" },
++                timeoutMs: 1_000,
++              },
++              appServer: { start: { transport: "stdio" } },
++              mutable: { pluginAppServer: {} },
++              usesSupervisionConnection: false,
++              runAbortController: new AbortController(),
++              assertCurrent: vi.fn(),
++              bindModelExecution: vi.fn(),
++            },
++          },
++        },
++      },
++    } as unknown as Parameters<typeof prepareCodexAttemptTurnRequest>[0];
++    const route = { armTurn: vi.fn(), cancelTurn: vi.fn() };
++    const prepared = await prepareCodexAttemptTurnRequest(
++      resources,
++      { state: {} } as Parameters<typeof prepareCodexAttemptTurnRequest>[1],
++      async () => route,
++      async () => true,
++    );
++
++    await prepared.startCodexTurn();
++
++    expect(native.record).toHaveBeenCalledTimes(1);
++    expect(native.cached).toEqual(effective);
++    expect(observedRequest?.collaborationMode).toEqual(requested);
++    expect(requested.settings.developer_instructions).toBeNull();
++  });
++});
+diff --git a/extensions/codex/src/app-server/run-attempt-plan-mode.test.ts b/extensions/codex/src/app-server/run-attempt-plan-mode.test.ts
+new file mode 100644
+index 00000000000..9175207af3c
+--- /dev/null
++++ b/extensions/codex/src/app-server/run-attempt-plan-mode.test.ts
+@@ -0,0 +1,159 @@
++import path from "node:path";
++import { describe, expect, it, vi } from "vitest";
++import * as bindingConnection from "./binding-connection.js";
++import {
++  resolveCodexSupervisionAppServerRuntimeOptions,
++  resolveOpenClawExecPolicyForCodexAppServer,
++} from "./config.js";
++import { buildCodexAppServerConnectionFingerprint } from "./plugin-app-cache-key.js";
++import { prepareCodexAttemptConnection } from "./run-attempt-connection.js";
++import { createParams, setupRunAttemptTestHooks, tempDir } from "./run-attempt-test-harness.js";
++import {
++  registerCodexTestSessionIdentity,
++  testCodexAppServerBindingStore,
++  writeCodexAppServerBinding,
++} from "./session-binding.test-helpers.js";
++
++// These launch-policy cases use only the in-memory binding fixture. They do
++// not need a durable session owner or its SQLite lifecycle cleanup.
++setupRunAttemptTestHooks({ sessionOwner: null });
++
++describe("normal Codex Plan-mode launch policy", () => {
++  it("clamps a supervised full-permission Plan turn to a native read-only sandbox", async () => {
++    const sessionFile = path.join(tempDir, "plan-supervision.jsonl");
++    const workspaceDir = path.join(tempDir, "plan-supervision-workspace");
++    const params = createParams(sessionFile, workspaceDir);
++    const pluginConfig = { supervision: { enabled: true } };
++    const config = { agents: { entries: { main: {} } } } as never;
++    const agentDir = path.join(tempDir, "plan-supervision-agent");
++    params.agentId = "main";
++    params.agentDir = agentDir;
++    params.planMode = true;
++    params.permissionMode = "read-only";
++    params.storedPermissionMode = "full";
++    params.sessionRoot = workspaceDir;
++    params.execOverrides = { mode: "deny" };
++    params.config = config;
++    registerCodexTestSessionIdentity(sessionFile, params.sessionId, params.sessionKey);
++    const execPolicy = resolveOpenClawExecPolicyForCodexAppServer({
++      config,
++      agentId: "main",
++      permissionMode: "full",
++      execOverrides: { mode: "full" },
++    });
++    const supervisedRuntime = resolveCodexSupervisionAppServerRuntimeOptions({
++      pluginConfig,
++      execPolicy,
++      config,
++      agentDir,
++      modelProvider: "openai",
++      model: "gpt-5.4-codex",
++      sessionPermissionMode: "full",
++      openClawSandboxActive: false,
++      requirementsToml: null,
++    });
++    await writeCodexAppServerBinding(sessionFile, {
++      threadId: "plan-supervised-thread",
++      cwd: workspaceDir,
++      connectionScope: "supervision",
++      supervisionSourceThreadId: "plan-supervised-thread",
++      conversationSourceTransferComplete: true,
++      model: "gpt-5.4-codex",
++      modelProvider: "openai",
++      preserveNativeModel: true,
++      appServerRuntimeFingerprint: buildCodexAppServerConnectionFingerprint(
++        supervisedRuntime,
++        agentDir,
++      ),
++    });
++
++    const connection = await prepareCodexAttemptConnection({
++      params,
++      options: { bindingStore: testCodexAppServerBindingStore, pluginConfig },
++    });
++    try {
++      expect(connection.appServer).toMatchObject({
++        sandbox: "read-only",
++        approvalPolicy: "on-request",
++      });
++      expect(params.permissionMode).toBe("read-only");
++      expect(params.storedPermissionMode).toBe("full");
++    } finally {
++      connection.cancellation.dispose();
++      connection.releaseModelExecution();
++    }
++  });
++
++  it("keeps host exec denial authoritative when the captured session mode is unset", async () => {
++    const sessionFile = path.join(tempDir, "plan-unset-denied.jsonl");
++    const workspaceDir = path.join(tempDir, "plan-unset-denied-workspace");
++    const params = createParams(sessionFile, workspaceDir);
++    params.agentId = "main";
++    params.planMode = true;
++    params.permissionMode = "read-only";
++    params.storedPermissionMode = null;
++    params.execOverrides = { mode: "deny" };
++    params.config = {
++      agents: { entries: { main: { tools: { exec: { mode: "deny" } } } } },
++    } as never;
++    registerCodexTestSessionIdentity(sessionFile, params.sessionId, params.sessionKey);
++
++    await expect(
++      prepareCodexAttemptConnection({
++        params,
++        options: { bindingStore: testCodexAppServerBindingStore },
++      }),
++    ).rejects.toThrow("effective tools.exec.mode=deny");
++  });
++
++  it("keeps explicit saved read-only authority in the native sandbox", async () => {
++    const sessionFile = path.join(tempDir, "plan-saved-readonly.jsonl");
++    const workspaceDir = path.join(tempDir, "plan-saved-readonly-workspace");
++    const params = createParams(sessionFile, workspaceDir);
++    params.agentId = "main";
++    params.planMode = true;
++    params.permissionMode = "read-only";
++    params.storedPermissionMode = "read-only";
++    params.execOverrides = { mode: "deny" };
++    params.config = { agents: { entries: { main: {} } } } as never;
++    registerCodexTestSessionIdentity(sessionFile, params.sessionId, params.sessionKey);
++
++    const resolveConnection = vi.spyOn(bindingConnection, "resolveCodexBindingAppServerConnection");
++    const connection = await prepareCodexAttemptConnection({
++      params,
++      options: { bindingStore: testCodexAppServerBindingStore },
++    });
++    try {
++      expect(resolveConnection).toHaveBeenCalledWith(
++        expect.objectContaining({
++          sessionPermissionMode: "read-only",
++          execPolicy: expect.objectContaining({ mode: "deny" }),
++        }),
++      );
++      expect(connection.appServer).toMatchObject({
++        sandbox: "read-only",
++        approvalPolicy: "on-request",
++      });
++    } finally {
++      connection.cancellation.dispose();
++      connection.releaseModelExecution();
++    }
++  });
++
++  it("fails closed when Plan arrives without a trusted raw permission snapshot", async () => {
++    const sessionFile = path.join(tempDir, "plan-missing-mode.jsonl");
++    const params = createParams(sessionFile, path.join(tempDir, "plan-missing-mode-workspace"));
++    params.agentId = "main";
++    params.planMode = true;
++    params.permissionMode = "read-only";
++    params.storedPermissionMode = undefined;
++    registerCodexTestSessionIdentity(sessionFile, params.sessionId, params.sessionKey);
++
++    await expect(
++      prepareCodexAttemptConnection({
++        params,
++        options: { bindingStore: testCodexAppServerBindingStore },
++      }),
++    ).rejects.toThrow("captured session permission snapshot");
++  });
++});
+diff --git a/extensions/codex/src/app-server/side-question-plan-mode.test.ts b/extensions/codex/src/app-server/side-question-plan-mode.test.ts
+new file mode 100644
+index 00000000000..1ebc81673ee
+--- /dev/null
++++ b/extensions/codex/src/app-server/side-question-plan-mode.test.ts
+@@ -0,0 +1,140 @@
++import { describe, expect, it } from "vitest";
++import {
++  ensureCodexAppServerClientRuntime,
++  recordCodexNativeThreadSettings,
++} from "./client-runtime.js";
++import { resolveCodexSupervisionAppServerRuntimeOptions } from "./config.js";
++import { buildCodexAppServerConnectionFingerprint } from "./plugin-app-cache-key.js";
++import {
++  getSharedCodexAppServerClientMock,
++  readCodexAppServerBindingMock,
++  runCodexAppServerSideQuestion,
++  sideParams,
++  useSideQuestionTestSetup,
++  createFakeClient,
++} from "./side-question.test-support.js";
++
++useSideQuestionTestSetup();
++
++const nativeSettings = {
++  mode: "default",
++  settings: {
++    model: "gpt-5.5",
++    reasoning_effort: null,
++    developer_instructions: "Preserve these native instructions.",
++  },
++} as const;
++
++function supervisionConnectionFingerprint(): string {
++  return buildCodexAppServerConnectionFingerprint(
++    resolveCodexSupervisionAppServerRuntimeOptions({
++      pluginConfig: { supervision: { enabled: true } },
++    }),
++  );
++}
++
++describe("Codex /btw Plan mode", () => {
++  it("keeps host exec denial authoritative when the session's saved mode is unset", async () => {
++    await expect(
++      runCodexAppServerSideQuestion(
++        sideParams({
++          cfg: { tools: { exec: { mode: "deny" } } } as never,
++          sessionEntry: {
++            sessionId: "session-1",
++            sessionFile: "/tmp/session-1.jsonl",
++            updatedAt: 1,
++            planMode: true,
++          },
++        }),
++      ),
++    ).rejects.toThrow("effective tools.exec.mode=deny");
++    expect(getSharedCodexAppServerClientMock).not.toHaveBeenCalled();
++  });
++
++  it("applies the read-only mapper exception, preserves model and effort, and selects Plan instructions", async () => {
++    const client = createFakeClient();
++    ensureCodexAppServerClientRuntime(client, { agentDir: "/tmp/agent" });
++    expect(recordCodexNativeThreadSettings(client, "parent-thread", nativeSettings)).toBe(true);
++    getSharedCodexAppServerClientMock.mockResolvedValue(client);
++    readCodexAppServerBindingMock.mockReturnValue({
++      threadId: "parent-thread",
++      connectionScope: "supervision",
++      supervisionSourceThreadId: "source-thread",
++      cwd: "/tmp/workspace",
++      model: "gpt-5.5",
++      modelProvider: "openai",
++      appServerRuntimeFingerprint: supervisionConnectionFingerprint(),
++      preserveNativeModel: true,
++      conversationSourceTransferComplete: true,
++    });
++    const sessionEntry = {
++      sessionId: "session-1",
++      sessionFile: "/tmp/session-1.jsonl",
++      updatedAt: 1,
++      permissionMode: "full" as const,
++      planMode: true,
++      sessionRoot: "/tmp/session-root",
++    };
++
++    try {
++      await expect(
++        runCodexAppServerSideQuestion(sideParams({ sessionEntry }), {
++          pluginConfig: { supervision: { enabled: true } },
++        }),
++      ).resolves.toEqual({ text: "Side answer." });
++
++      const forkRequest = client.request.mock.calls.find(([method]) => method === "thread/fork");
++      const forkParams = forkRequest?.[1] as Record<string, unknown> | undefined;
++      expect(forkParams).toMatchObject({
++        threadId: "parent-thread",
++        sandbox: "read-only",
++        approvalPolicy: "on-request",
++        runtimeWorkspaceRoots: ["/tmp/session-root"],
++      });
++      const turnRequest = client.request.mock.calls.find(([method]) => method === "turn/start");
++      const turnParams = turnRequest?.[1] as Record<string, unknown> | undefined;
++      expect(turnParams).toMatchObject({
++        model: "gpt-5.5",
++        collaborationMode: {
++          mode: "plan",
++          settings: { ...nativeSettings.settings, developer_instructions: null },
++        },
++      });
++      expect(turnParams).not.toHaveProperty("effort");
++      expect(sessionEntry.permissionMode).toBe("full");
++      expect(sessionEntry.planMode).toBe(true);
++      expect(getSharedCodexAppServerClientMock).toHaveBeenCalledWith(
++        expect.objectContaining({
++          authProfileId: null,
++          startOptions: expect.objectContaining({ homeScope: "user" }),
++        }),
++      );
++    } finally {
++      client.close();
++    }
++  });
++
++  it("refuses an explicit mode change when the current native snapshot is unavailable", async () => {
++    const client = createFakeClient();
++    ensureCodexAppServerClientRuntime(client, { agentDir: "/tmp/agent" });
++    getSharedCodexAppServerClientMock.mockResolvedValue(client);
++
++    try {
++      await expect(
++        runCodexAppServerSideQuestion(
++          sideParams({
++            sessionEntry: {
++              sessionId: "session-1",
++              sessionFile: "/tmp/session-1.jsonl",
++              updatedAt: 1,
++              planMode: true,
++            },
++          }),
++        ),
++      ).rejects.toThrow("complete thread settings snapshot");
++      expect(client.request.mock.calls.some(([method]) => method === "thread/fork")).toBe(false);
++    } finally {
++      client.close();
++    }
++  });
++});
+diff --git a/extensions/codex/src/app-server/thread-native-settings.test.ts b/extensions/codex/src/app-server/thread-native-settings.test.ts
+new file mode 100644
+index 00000000000..9a0d8856b69
+--- /dev/null
++++ b/extensions/codex/src/app-server/thread-native-settings.test.ts
+@@ -0,0 +1,275 @@
++import { describe, expect, it, vi } from "vitest";
++import type { CodexAppServerClient } from "./client.js";
++import {
++  buildCodexNativeTurnStartModeParams,
++  openCodexNativeThreadSettings,
++  readCodexNativeThreadSettings,
++  recordCodexNativeThreadSettings,
++  resolveCodexNativeCollaborationMode,
++  updateCodexFreshThreadSettings,
++  withCodexNativeCollaborationMode,
++} from "./thread-native-settings.js";
++
++const nativePlanMode = {
++  mode: "plan",
++  settings: {
++    model: "native-model",
++    reasoning_effort: "high",
++    developer_instructions: "Keep the imported thread instructions.",
++  },
++} as const;
++
++function createNativeSettingsFixture() {
++  const notificationHandlers = new Set<(value: unknown) => void>();
++  const closeHandlers = new Set<() => void>();
++  const client = {
++    addNotificationHandler: (handler: (value: unknown) => void) => {
++      notificationHandlers.add(handler);
++      return () => notificationHandlers.delete(handler);
++    },
++    addCloseHandler: (handler: () => void) => {
++      closeHandlers.add(handler);
++      return () => closeHandlers.delete(handler);
++    },
++  } as unknown as CodexAppServerClient;
++  return {
++    client,
++    notify(notification: unknown) {
++      for (const handler of notificationHandlers) {
++        handler(notification);
++      }
++    },
++    close() {
++      for (const handler of closeHandlers) {
++        handler();
++      }
++    },
++  };
++}
++
++describe("Codex native thread settings", () => {
++  it("preserves custom settings in the same mode and requests built-in instructions on mode change", () => {
++    const fixture = createNativeSettingsFixture();
++    openCodexNativeThreadSettings(fixture.client);
++    fixture.notify({
++      method: "thread/settings/updated",
++      params: {
++        threadId: "thread-plan",
++        threadSettings: { collaborationMode: nativePlanMode },
++      },
++    });
++    const parsed = readCodexNativeThreadSettings(fixture.client, "thread-plan");
++
++    expect(parsed).toEqual(nativePlanMode);
++    expect(parsed && withCodexNativeCollaborationMode(parsed, "default")).toEqual({
++      mode: "default",
++      settings: {
++        model: "native-model",
++        reasoning_effort: "high",
++        developer_instructions: null,
++      },
++    });
++    expect(parsed && withCodexNativeCollaborationMode(parsed, "plan")).toEqual({
++      ...nativePlanMode,
++      settings: { ...nativePlanMode.settings },
++    });
++  });
++
++  it("waits for the authoritative native update notification after the RPC acknowledgment", async () => {
++    const notifications = new Set<(value: unknown) => void>();
++    const closeHandlers = new Set<() => void>();
++    const requests: Array<{ method: string; params: unknown }> = [];
++    const request = vi.fn(async (method: string, params?: unknown) => {
++      requests.push({ method, params });
++      return {};
++    });
++    const client = {
++      request,
++      addNotificationHandler: (handler: (value: unknown) => void) => {
++        notifications.add(handler);
++        return () => notifications.delete(handler);
++      },
++      addCloseHandler: (handler: () => void) => {
++        closeHandlers.add(handler);
++        return () => closeHandlers.delete(handler);
++      },
++    } as unknown as CodexAppServerClient;
++    const expected = {
++      mode: "plan" as const,
++      settings: {
++        model: "fresh-model",
++        reasoning_effort: "medium",
++        developer_instructions: null,
++      },
++    };
++    let settled = false;
++    const pending = updateCodexFreshThreadSettings({
++      client,
++      threadId: "fresh-thread",
++      mode: "plan",
++      model: expected.settings.model,
++      reasoningEffort: expected.settings.reasoning_effort,
++      requestOptions: { timeoutMs: 1_000 },
++    }).then((value) => {
++      settled = true;
++      return value;
++    });
++
++    await vi.waitFor(() => expect(requests).toHaveLength(1));
++    expect(requests[0]).toEqual({
++      method: "thread/settings/update",
++      params: { threadId: "fresh-thread", collaborationMode: expected },
++    });
++    await Promise.resolve();
++    expect(settled).toBe(false);
++
++    for (const handler of notifications) {
++      handler({
++        method: "thread/settings/updated",
++        params: { threadId: "fresh-thread", threadSettings: { collaborationMode: expected } },
++      });
++    }
++    await expect(pending).resolves.toEqual(expected);
++    expect(closeHandlers.size).toBe(1);
++    expect(notifications.size).toBe(1);
++  });
++
++  it("rejects a fresh native settings update without the complete actual start tuple", async () => {
++    const request = vi.fn();
++    const client = {
++      request,
++      addNotificationHandler: vi.fn(),
++      addCloseHandler: vi.fn(),
++    } as unknown as CodexAppServerClient;
++    await expect(
++      updateCodexFreshThreadSettings({
++        client,
++        threadId: "fresh-thread",
++        mode: "default",
++        model: "fresh-model",
++        reasoningEffort: undefined,
++        requestOptions: { timeoutMs: 100 },
++      }),
++    ).rejects.toThrow("actual thread model and effort");
++    expect(request).not.toHaveBeenCalled();
++  });
++
++  it("requires a complete matching snapshot before changing native collaboration mode", () => {
++    expect(
++      resolveCodexNativeCollaborationMode({
++        planMode: false,
++        nativeSettings: nativePlanMode,
++        selectedModel: "native-model",
++      }),
++    ).toEqual({
++      mode: "default",
++      settings: {
++        ...nativePlanMode.settings,
++        developer_instructions: null,
++      },
++    });
++    expect(
++      resolveCodexNativeCollaborationMode({
++        planMode: undefined,
++        nativeSettings: undefined,
++      }),
++    ).toBeUndefined();
++    expect(() =>
++      resolveCodexNativeCollaborationMode({
++        planMode: true,
++        nativeSettings: undefined,
++      }),
++    ).toThrow("complete thread settings snapshot");
++    expect(() =>
++      resolveCodexNativeCollaborationMode({
++        planMode: true,
++        nativeSettings: nativePlanMode,
++        selectedModel: "other-model",
++      }),
++    ).toThrow("selected model differs");
++  });
++
++  it("sends native Plan settings unchanged and leaves supervision settings to Codex", () => {
++    expect(
++      buildCodexNativeTurnStartModeParams({
++        planCollaborationMode: nativePlanMode,
++        usesSupervisionConnection: false,
++        model: "ignored-model",
++        effort: "low",
++      }),
++    ).toEqual({ collaborationMode: nativePlanMode });
++    expect(
++      buildCodexNativeTurnStartModeParams({
++        planCollaborationMode: undefined,
++        usesSupervisionConnection: true,
++        model: "native-model",
++        effort: "low",
++      }),
++    ).toEqual({});
++    expect(
++      buildCodexNativeTurnStartModeParams({
++        planCollaborationMode: undefined,
++        usesSupervisionConnection: false,
++        model: "native-model",
++        effort: "low",
++      }),
++    ).toEqual({
++      effort: "low",
++      collaborationMode: {
++        mode: "default",
++        settings: {
++          model: "native-model",
++          reasoning_effort: "low",
++          developer_instructions: null,
++        },
++      },
++    });
++  });
++
++  it("preserves explicit null and rejects incomplete native settings", () => {
++    const fixture = createNativeSettingsFixture();
++    openCodexNativeThreadSettings(fixture.client);
++    const complete = {
++      mode: "default",
++      settings: {
++        model: "native-model",
++        reasoning_effort: null,
++        developer_instructions: null,
++      },
++    };
++    expect(recordCodexNativeThreadSettings(fixture.client, "complete", complete)).toBe(true);
++    expect(readCodexNativeThreadSettings(fixture.client, "complete")).toEqual(complete);
++    for (const incomplete of [
++      { mode: "default", settings: { model: "native-model" } },
++      { mode: "default", settings: { model: "native-model", reasoning_effort: null } },
++      { mode: "default", settings: { model: "native-model", developer_instructions: null } },
++      { mode: "default", settings: { model: 1 } },
++    ]) {
++      expect(recordCodexNativeThreadSettings(fixture.client, "incomplete", incomplete)).toBe(false);
++      expect(readCodexNativeThreadSettings(fixture.client, "incomplete")).toBeUndefined();
++    }
++  });
++
++  it("keeps the cache bounded, refreshes reads, and removes stale values on invalid updates", () => {
++    const fixture = createNativeSettingsFixture();
++    openCodexNativeThreadSettings(fixture.client);
++    for (let index = 0; index < 64; index += 1) {
++      expect(
++        recordCodexNativeThreadSettings(fixture.client, `thread-${index}`, nativePlanMode),
++      ).toBe(true);
++    }
++    expect(readCodexNativeThreadSettings(fixture.client, "thread-0")).toEqual(nativePlanMode);
++    expect(recordCodexNativeThreadSettings(fixture.client, "thread-64", nativePlanMode)).toBe(true);
++    expect(readCodexNativeThreadSettings(fixture.client, "thread-0")).toEqual(nativePlanMode);
++    expect(readCodexNativeThreadSettings(fixture.client, "thread-1")).toBeUndefined();
++    expect(
++      recordCodexNativeThreadSettings(fixture.client, "thread-0", {
++        mode: "default",
++        settings: { model: "partial" },
++      }),
++    ).toBe(false);
++    expect(readCodexNativeThreadSettings(fixture.client, "thread-0")).toBeUndefined();
++    fixture.close();
++    expect(readCodexNativeThreadSettings(fixture.client, "thread-64")).toBeUndefined();
++  });
++});
+diff --git a/extensions/codex/src/app-server/thread-native-settings.ts b/extensions/codex/src/app-server/thread-native-settings.ts
+new file mode 100644
+index 00000000000..cf46000043d
+--- /dev/null
++++ b/extensions/codex/src/app-server/thread-native-settings.ts
+@@ -0,0 +1,430 @@
++import {
++  resolveSessionPlanModeLaunchPermissionMode,
++  resolveSessionPlanModePermissionMode,
++  type EmbeddedRunAttemptParamsV2,
++} from "openclaw/plugin-sdk/agent-harness-runtime";
++import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
++import { loadExecApprovals } from "openclaw/plugin-sdk/exec-approvals-runtime";
++import { defineCodexBuildState } from "../build-state.js";
++import type { CodexAppServerClient } from "./client.js";
++import { resolveOpenClawExecPolicyForCodexAppServer } from "./config.js";
++import { CODEX_SESSION_PERMISSION_EXEC_MODES } from "./session-permission-policy.js";
++
++export type CodexNativeCollaborationModeName = "default" | "plan";
++
++type CodexSessionPermissionMode = NonNullable<EmbeddedRunAttemptParamsV2["permissionMode"]>;
++
++export type CodexNativeCollaborationModeInput = Readonly<{
++  mode: CodexNativeCollaborationModeName;
++  settings: Readonly<{
++    model: string;
++    reasoning_effort?: string | null;
++    developer_instructions?: string | null;
++  }>;
++}>;
++
++/** The exact native settings Codex needs to preserve when only changing mode. */
++export type CodexNativeCollaborationMode = Readonly<{
++  mode: CodexNativeCollaborationModeName;
++  settings: Readonly<{
++    model: string;
++    reasoning_effort: string | null;
++    developer_instructions: string | null;
++  }>;
++}>;
++
++type CodexNativeSettingsRequestOptions = NonNullable<
++  Parameters<CodexAppServerClient["request"]>[2]
++>;
++
++const CODEX_NATIVE_THREAD_SETTINGS_MAX_ENTRIES = 64;
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return value !== null && typeof value === "object" && !Array.isArray(value);
++}
++
++/** A mode toggle is safe only when the complete native settings snapshot is known. */
++function parseCodexNativeCollaborationMode(
++  value: unknown,
++): CodexNativeCollaborationMode | undefined {
++  if (!isRecord(value) || (value.mode !== "default" && value.mode !== "plan")) {
++    return undefined;
++  }
++  const settings = value.settings;
++  if (!isRecord(settings)) {
++    return undefined;
++  }
++  const model = settings.model;
++  const reasoningEffort = settings.reasoning_effort;
++  const developerInstructions = settings.developer_instructions;
++  if (
++    typeof model !== "string" ||
++    !("reasoning_effort" in settings) ||
++    !isStringOrNull(reasoningEffort) ||
++    !("developer_instructions" in settings) ||
++    !isStringOrNull(developerInstructions)
++  ) {
++    return undefined;
++  }
++  return {
++    mode: value.mode,
++    settings: {
++      model,
++      reasoning_effort: reasoningEffort,
++      developer_instructions: developerInstructions,
++    },
++  };
++}
++
++function isStringOrNull(value: unknown): value is string | null {
++  return value === null || typeof value === "string";
++}
++
++export function withCodexNativeCollaborationMode(
++  current: CodexNativeCollaborationMode,
++  mode: CodexNativeCollaborationModeName,
++): CodexNativeCollaborationMode {
++  return {
++    mode,
++    settings: {
++      ...current.settings,
++      ...(current.mode === mode ? {} : { developer_instructions: null }),
++    },
++  };
++}
++
++type FreshThreadSettingsWaiter = {
++  promise: Promise<CodexNativeCollaborationMode>;
++  dispose: () => void;
++};
++
++function hasSameNativeSettings(
++  actual: CodexNativeCollaborationMode,
++  expected: CodexNativeCollaborationMode,
++): boolean {
++  return (
++    actual.mode === expected.mode &&
++    actual.settings.model === expected.settings.model &&
++    actual.settings.reasoning_effort === expected.settings.reasoning_effort &&
++    actual.settings.developer_instructions === expected.settings.developer_instructions
++  );
++}
++
++function watchFreshThreadSettingsUpdate(params: {
++  client: CodexAppServerClient;
++  threadId: string;
++  expected: CodexNativeCollaborationMode;
++  timeoutMs: number;
++  assertCurrent?: () => void;
++}): FreshThreadSettingsWaiter {
++  openCodexNativeThreadSettings(params.client);
++  let settled = false;
++  let removeNotificationHandler: () => void = () => {};
++  let removeCloseHandler: () => void = () => {};
++  let timeout: ReturnType<typeof setTimeout> | undefined;
++  let resolvePromise!: (value: CodexNativeCollaborationMode) => void;
++  let rejectPromise!: (error: Error) => void;
++  const promise = new Promise<CodexNativeCollaborationMode>((resolve, reject) => {
++    resolvePromise = resolve;
++    rejectPromise = reject;
++  });
++  const dispose = () => {
++    if (timeout) {
++      clearTimeout(timeout);
++      timeout = undefined;
++    }
++    removeNotificationHandler();
++    removeCloseHandler();
++  };
++  const resolve = (value: CodexNativeCollaborationMode) => {
++    if (settled) {
++      return;
++    }
++    settled = true;
++    dispose();
++    resolvePromise(value);
++  };
++  const reject = (error: Error) => {
++    if (settled) {
++      return;
++    }
++    settled = true;
++    dispose();
++    rejectPromise(error);
++  };
++  removeNotificationHandler = params.client.addNotificationHandler((notification) => {
++    if (notification.method !== "thread/settings/updated" || !isRecord(notification.params)) {
++      return;
++    }
++    if (notification.params.threadId !== params.threadId) {
++      return;
++    }
++    try {
++      params.assertCurrent?.();
++      const threadSettings = notification.params.threadSettings;
++      const received = parseCodexNativeCollaborationMode(
++        isRecord(threadSettings) ? threadSettings.collaborationMode : undefined,
++      );
++      if (!received) {
++        throw new Error("Codex returned incomplete native settings for a new thread.");
++      }
++      if (!hasSameNativeSettings(received, params.expected)) {
++        throw new Error("Codex native settings changed while initializing a new thread.");
++      }
++      const cached = readCodexNativeThreadSettings(params.client, params.threadId);
++      if (!cached || !hasSameNativeSettings(cached, params.expected)) {
++        throw new Error("Codex native settings notification was not retained by the client.");
++      }
++      resolve(cached);
++    } catch (error) {
++      reject(error instanceof Error ? error : new Error(String(error)));
++    }
++  });
++  removeCloseHandler = params.client.addCloseHandler(() => {
++    reject(new Error("Codex app-server client closed before native settings were read back."));
++  });
++  timeout = setTimeout(
++    () => {
++      reject(
++        new Error("Timed out waiting for authoritative native settings for a new Codex thread."),
++      );
++    },
++    Math.max(1, params.timeoutMs),
++  );
++  return { promise, dispose };
++}
++
++/** Applies an explicit mode to a just-started thread and waits for native readback. */
++export async function updateCodexFreshThreadSettings(params: {
++  client: CodexAppServerClient;
++  threadId: string;
++  mode: CodexNativeCollaborationModeName;
++  model: string;
++  reasoningEffort: string | null | undefined;
++  requestOptions: CodexNativeSettingsRequestOptions;
++}): Promise<CodexNativeCollaborationMode> {
++  if (typeof params.model !== "string" || !isStringOrNull(params.reasoningEffort)) {
++    throw new Error("Cannot initialize native Codex mode without actual thread model and effort.");
++  }
++  const expected: CodexNativeCollaborationMode = {
++    mode: params.mode,
++    settings: {
++      model: params.model,
++      reasoning_effort: params.reasoningEffort,
++      developer_instructions: null,
++    },
++  };
++  const waiter = watchFreshThreadSettingsUpdate({
++    client: params.client,
++    threadId: params.threadId,
++    expected,
++    timeoutMs: params.requestOptions.timeoutMs ?? 30_000,
++    assertCurrent: params.requestOptions.assertCurrent,
++  });
++  try {
++    const [, actual] = await Promise.all([
++      params.client.request(
++        "thread/settings/update",
++        { threadId: params.threadId, collaborationMode: expected },
++        params.requestOptions,
++      ),
++      waiter.promise,
++    ]);
++    params.requestOptions.assertCurrent?.();
++    return actual;
++  } finally {
++    waiter.dispose();
++  }
++}
++
++/** Resolve native and process policy from one captured session row. */
++export function resolveCodexSessionModePolicy(
++  sessionEntry:
++    | Readonly<{
++        planMode?: boolean;
++        permissionMode?: CodexSessionPermissionMode | null;
++      }>
++    | undefined,
++  params: { config?: OpenClawConfig; agentId?: string },
++) {
++  const planMode = sessionEntry?.planMode;
++  const storedPermissionMode = sessionEntry ? (sessionEntry.permissionMode ?? null) : undefined;
++  const permissionMode = resolveSessionPlanModePermissionMode({
++    planMode,
++    permissionMode: storedPermissionMode,
++  });
++  const launchPermissionMode = resolveSessionPlanModeLaunchPermissionMode({
++    planMode,
++    storedPermissionMode,
++    effectivePermissionMode: permissionMode,
++  });
++  const execPolicy = resolveOpenClawExecPolicyForCodexAppServer({
++    permissionMode: launchPermissionMode,
++    execOverrides: launchPermissionMode
++      ? { mode: CODEX_SESSION_PERMISSION_EXEC_MODES[launchPermissionMode] }
++      : undefined,
++    approvals: launchPermissionMode === "full" ? undefined : loadExecApprovals(),
++    config: params.config,
++    agentId: params.agentId,
++  });
++  return { permissionMode, launchPermissionMode, execPolicy };
++}
++
++/** A mode toggle is safe only when the complete native settings snapshot is known. */
++export function resolveCodexNativeCollaborationMode(params: {
++  planMode: boolean | undefined;
++  nativeSettings: CodexNativeCollaborationMode | undefined;
++  selectedModel?: string;
++}): CodexNativeCollaborationMode | undefined {
++  if (params.planMode === undefined) {
++    return undefined;
++  }
++  if (!params.nativeSettings) {
++    throw new Error(
++      "Cannot change native Codex Plan mode without a complete thread settings snapshot.",
++    );
++  }
++  if (params.selectedModel && params.nativeSettings.settings.model !== params.selectedModel) {
++    throw new Error(
++      "Cannot change native Codex Plan mode while the selected model differs from the native thread model.",
++    );
++  }
++  return withCodexNativeCollaborationMode(
++    params.nativeSettings,
++    params.planMode ? "plan" : "default",
++  );
++}
++
++/** Preserve supervision's native turn settings and the existing default path. */
++export function buildCodexNativeTurnStartModeParams(params: {
++  planCollaborationMode: CodexNativeCollaborationMode | undefined;
++  usesSupervisionConnection: boolean;
++  model: string;
++  effort: string | undefined;
++}) {
++  if (params.planCollaborationMode) {
++    return { collaborationMode: params.planCollaborationMode };
++  }
++  if (params.usesSupervisionConnection) {
++    return {};
++  }
++  return {
++    effort: params.effort,
++    collaborationMode: {
++      mode: "default" as const,
++      settings: {
++        model: params.model,
++        reasoning_effort: params.effort,
++        developer_instructions: null,
++      },
++    },
++  };
++}
++
++/** A per-physical-client LRU; it is a readback cache, never persisted authority. */
++class CodexNativeThreadSettingsCache {
++  readonly #entries = new Map<string, CodexNativeCollaborationMode>();
++  readonly #maxEntries: number;
++
++  constructor(maxEntries = CODEX_NATIVE_THREAD_SETTINGS_MAX_ENTRIES) {
++    if (!Number.isSafeInteger(maxEntries) || maxEntries < 1) {
++      throw new RangeError("Codex native thread settings cache limit must be positive");
++    }
++    this.#maxEntries = maxEntries;
++  }
++
++  get(threadId: string): CodexNativeCollaborationMode | undefined {
++    const value = this.#entries.get(threadId);
++    if (!value) {
++      return undefined;
++    }
++    this.#entries.delete(threadId);
++    this.#entries.set(threadId, value);
++    return withCodexNativeCollaborationMode(value, value.mode);
++  }
++
++  set(threadId: string, value: unknown): boolean {
++    const settings = parseCodexNativeCollaborationMode(value);
++    if (!settings) {
++      this.#entries.delete(threadId);
++      return false;
++    }
++    this.#entries.delete(threadId);
++    while (this.#entries.size >= this.#maxEntries) {
++      const oldest = this.#entries.keys().next().value;
++      if (oldest === undefined) {
++        break;
++      }
++      this.#entries.delete(oldest);
++    }
++    this.#entries.set(threadId, settings);
++    return true;
++  }
++
++  delete(threadId: string): void {
++    this.#entries.delete(threadId);
++  }
++
++  clear(): void {
++    this.#entries.clear();
++  }
++
++  get size(): number {
++    return this.#entries.size;
++  }
++}
++
++const getNativeSettingsState = defineCodexBuildState(
++  "openclaw.codexAppServerNativeThreadSettings",
++  () => ({ caches: new WeakMap<object, CodexNativeThreadSettingsCache>() }),
++);
++
++export function openCodexNativeThreadSettings(client: CodexAppServerClient): void {
++  const state = getNativeSettingsState();
++  if (state.caches.has(client)) {
++    return;
++  }
++  const cache = new CodexNativeThreadSettingsCache();
++  state.caches.set(client, cache);
++  const removeNotificationHandler = client.addNotificationHandler((notification) => {
++    if (notification.method === "thread/settings/updated") {
++      const params = notification.params;
++      if (isRecord(params) && typeof params.threadId === "string") {
++        const threadSettings = params.threadSettings;
++        cache.set(
++          params.threadId,
++          isRecord(threadSettings) ? threadSettings.collaborationMode : undefined,
++        );
++      }
++    } else if (
++      notification.method === "thread/archived" ||
++      notification.method === "thread/deleted" ||
++      notification.method === "thread/closed"
++    ) {
++      const params = notification.params;
++      if (isRecord(params) && typeof params.threadId === "string") {
++        cache.delete(params.threadId);
++      }
++    }
++  });
++  client.addCloseHandler(() => {
++    removeNotificationHandler();
++    cache.clear();
++    state.caches.delete(client);
++  });
++}
++
++export function readCodexNativeThreadSettings(
++  client: object,
++  threadId: string,
++): CodexNativeCollaborationMode | undefined {
++  return getNativeSettingsState().caches.get(client)?.get(threadId);
++}
++
++export function recordCodexNativeThreadSettings(
++  client: object,
++  threadId: string,
++  value: unknown,
++): boolean {
++  return getNativeSettingsState().caches.get(client)?.set(threadId, value) ?? false;
++}
+diff --git a/extensions/codex/src/app-server/thread-resume-native-settings.test.ts b/extensions/codex/src/app-server/thread-resume-native-settings.test.ts
+new file mode 100644
+index 00000000000..3c2160ba538
+--- /dev/null
++++ b/extensions/codex/src/app-server/thread-resume-native-settings.test.ts
+@@ -0,0 +1,70 @@
++import { afterEach, describe, expect, it } from "vitest";
++import {
++  ensureCodexAppServerClientRuntime,
++  readCodexNativeThreadSettings,
++} from "./client-runtime.js";
++import { threadStartResult } from "./codex-app-server.test-fixtures.js";
++import { createClientHarness } from "./test-support.js";
++import { resumeCodexAppServerThread } from "./thread-resume.js";
++
++const clients: Array<ReturnType<typeof createClientHarness>["client"]> = [];
++
++afterEach(() => {
++  for (const client of clients.splice(0)) {
++    client.close();
++  }
++});
++
++function createRuntimeClient() {
++  const harness = createClientHarness();
++  clients.push(harness.client);
++  ensureCodexAppServerClientRuntime(harness.client, { agentDir: "/tmp/codex-plan-test" });
++  return harness.client;
++}
++
++describe("native settings from common thread resume", () => {
++  it("caches the complete mode and keeps explicit null settings on the physical client", async () => {
++    const client = createRuntimeClient();
++    const nativeSettings = {
++      mode: "plan",
++      settings: {
++        model: "native-model",
++        reasoning_effort: null,
++        developer_instructions: "Preserve imported developer instructions.",
++      },
++    } as const;
++    const response = {
++      ...threadStartResult("native-thread"),
++      collaborationMode: nativeSettings,
++    };
++
++    await resumeCodexAppServerThread({
++      client,
++      abandonClient: async () => client.close(),
++      request: { threadId: "native-thread" },
++      requestResume: async () => response,
++    });
++
++    expect(readCodexNativeThreadSettings(client, "native-thread")).toEqual(nativeSettings);
++  });
++
++  it("clears the cache when native resume omits required settings", async () => {
++    const client = createRuntimeClient();
++    const response = {
++      ...threadStartResult("native-thread"),
++      collaborationMode: {
++        mode: "default",
++        settings: { model: "native-model" },
++      },
++    };
++
++    await resumeCodexAppServerThread({
++      client,
++      abandonClient: async () => client.close(),
++      request: { threadId: "native-thread" },
++      requestResume: async () => response,
++    });
++
++    expect(readCodexNativeThreadSettings(client, "native-thread")).toBeUndefined();
++  });
++});
+diff --git a/extensions/codex/src/conversation-binding-plan-mode.test.ts b/extensions/codex/src/conversation-binding-plan-mode.test.ts
+new file mode 100644
+index 00000000000..eba63e1dd82
+--- /dev/null
++++ b/extensions/codex/src/conversation-binding-plan-mode.test.ts
+@@ -0,0 +1,560 @@
++import { resolveStorePath, upsertSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
++import { useSessionStoreTempDirs } from "openclaw/plugin-sdk/sqlite-runtime-testing";
++import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import type { CodexNativeCollaborationMode } from "./app-server/thread-native-settings.js";
++
++const sessionDirs = useSessionStoreTempDirs(afterAll, "openclaw-codex-bound-plan-");
++
++const testState = vi.hoisted(() => ({
++  client: undefined as
++    | {
++        getInstanceId: () => string;
++        request: (method: string, params?: Record<string, unknown>) => Promise<unknown>;
++        addNotificationHandler: (handler: (notification: unknown) => void) => () => void;
++        addRequestHandler: () => () => void;
++        addCloseHandler: () => () => void;
++        close: ReturnType<typeof vi.fn>;
++      }
++    | undefined,
++  clientId: "codex-plan-client",
++  binding: undefined as Record<string, unknown> | undefined,
++  runtime: {} as Record<string, unknown>,
++  planMode: undefined as boolean | undefined,
++  startedThreadId: "thread-started",
++  nativeSettings: undefined as unknown,
++  nativeByThread: new Map<string, unknown>(),
++  requests: [] as Array<{ method: string; params?: Record<string, unknown> }>,
++  notificationHandlers: new Set<(notification: unknown) => void>(),
++  turnParams: undefined as Record<string, unknown> | undefined,
++  closedClients: [] as string[],
++  releasedBindings: [] as Array<{ clientId: string; threadId: string }>,
++  siblingClientThreads: new Set<string>(),
++}));
++
++vi.mock("./app-server/attempt-client-cleanup.js", () => ({
++  CODEX_APP_SERVER_UNSUBSCRIBE_TIMEOUT_MS: 1_000,
++  CodexAppServerUnsafeSubscriptionError: class CodexAppServerUnsafeSubscriptionError extends Error {},
++  closeCodexStartupClientBestEffort: vi.fn(async (client: { getInstanceId: () => string }) => {
++    testState.closedClients.push(client.getInstanceId());
++  }),
++  interruptCodexTurnAndWaitBestEffort: vi.fn(async () => true),
++  retireUnsafeCodexTurnClientBestEffort: vi.fn(async () => undefined),
++  unsubscribeCodexThreadBestEffort: vi.fn(async () => true),
++}));
++vi.mock("./app-server/auth-profile.js", async (importOriginal) => {
++  const actual = await importOriginal<typeof import("./app-server/auth-profile.js")>();
++  return { ...actual, normalizeCodexAppServerBindingModelProvider: () => "openai" };
++});
++vi.mock("./app-server/client-runtime.js", () => ({
++  consumeCodexAppServerLiveThread: vi.fn(async () => undefined),
++  isCodexAppServerClientRuntimeLive: () => false,
++  readCodexNativeThreadSettings: (_client: unknown, threadId: string) =>
++    testState.nativeByThread.get(threadId) as CodexNativeCollaborationMode | undefined,
++}));
++vi.mock("./app-server/client.js", () => ({
++  isCodexAppServerIndeterminateRequestCancellationError: () => false,
++  isCodexAppServerOverloadError: () => false,
++}));
++vi.mock("./app-server/config.js", async (importOriginal) => {
++  const actual = await importOriginal<typeof import("./app-server/config.js")>();
++  return {
++    ...actual,
++    codexSandboxPolicyForTurn: () => ({ type: "workspaceWrite", writableRoots: [] }),
++  };
++});
++vi.mock("./app-server/session-binding.js", async (importOriginal) => {
++  const actual = await importOriginal<typeof import("./app-server/session-binding.js")>();
++  return { ...actual, assertCodexBindingMayBeReplaced: () => undefined };
++});
++vi.mock("./app-server/shared-client.js", () => ({
++  getLeasedSharedCodexAppServerClient: async () => testState.client,
++  releaseCodexAppServerClientLease: vi.fn(),
++  withLeasedCodexAppServerClientStartSelectionRetry: async (params: {
++    run: (
++      client: unknown,
++      requestOptions: () => { timeoutMs: number; assertCurrent: () => void },
++    ) => Promise<unknown>;
++  }) =>
++    await params.run(testState.client, () => ({
++      timeoutMs: 1_000,
++      assertCurrent: () => undefined,
++    })),
++}));
++vi.mock("./app-server/thread-lifecycle.js", () => ({
++  CODEX_NATIVE_PERSONALITY_NONE: "none",
++  resolveCodexAppServerRequestModelSelection: () => ({
++    model: "gpt-5.4-codex",
++    modelProvider: "openai",
++  }),
++}));
++vi.mock("./app-server/thread-ownership.js", () => ({
++  isSameCodexAppServerThreadOwner: (
++    current: Record<string, unknown> | undefined,
++    expected: Record<string, unknown>,
++  ) => current?.threadId === expected.threadId && current?.clientId === expected.clientId,
++  releaseCodexAppServerBindingSubscription: vi.fn(
++    async (binding: { clientId: string; threadId: string }) => {
++      testState.releasedBindings.push({ ...binding });
++      testState.siblingClientThreads.delete(binding.threadId);
++    },
++  ),
++  retainCodexAppServerBindingSubscription: vi.fn(async () => true),
++  withExclusiveCodexAppServerThread: async (params: { run: () => Promise<unknown> }) =>
++    await params.run(),
++}));
++vi.mock("./app-server/thread-resume.js", () => ({
++  resumeCodexAppServerThread: async (params: {
++    request: { threadId: string };
++    assertCurrent?: () => void;
++    requestResume: (request: unknown) => Promise<Record<string, unknown>>;
++  }) => {
++    const response = await params.requestResume(params.request);
++    params.assertCurrent?.();
++    const candidate = response.collaborationMode as
++      | { mode?: unknown; settings?: Record<string, unknown> }
++      | undefined;
++    if (
++      candidate &&
++      (candidate.mode === "default" || candidate.mode === "plan") &&
++      typeof candidate.settings?.model === "string" &&
++      Object.hasOwn(candidate.settings, "reasoning_effort") &&
++      (typeof candidate.settings.reasoning_effort === "string" ||
++        candidate.settings.reasoning_effort === null) &&
++      Object.hasOwn(candidate.settings, "developer_instructions") &&
++      (typeof candidate.settings.developer_instructions === "string" ||
++        candidate.settings.developer_instructions === null)
++    ) {
++      testState.nativeByThread.set(params.request.threadId, candidate);
++    } else {
++      testState.nativeByThread.delete(params.request.threadId);
++    }
++    return response;
++  },
++}));
++vi.mock("./app-server/turn-router.js", () => ({
++  getCodexAppServerTurnRouter: () => ({
++    reserveThread: (params: {
++      threadId: string;
++      onNotification: (notification: unknown) => void;
++    }) => ({
++      armTurn: () => undefined,
++      bindTurn: async (turnId: string) => {
++        params.onNotification({
++          method: "turn/completed",
++          params: {
++            threadId: params.threadId,
++            turn: {
++              id: turnId,
++              status: "completed",
++              items: [{ id: "answer", type: "agentMessage", text: "Plan turn completed" }],
++            },
++          },
++        });
++      },
++      cancelTurn: async () => undefined,
++      release: () => undefined,
++    }),
++  }),
++}));
++vi.mock("./conversation-binding-preparation.js", async (importOriginal) => {
++  const actual = await importOriginal<typeof import("./conversation-binding-preparation.js")>();
++  return {
++    ...actual,
++    assertNativeConversationApprovalPolicySupported: () => undefined,
++    buildConversationThreadRequestForClient: async () => ({
++      cwd: "/synthetic/workspace",
++      model: "gpt-5.4-codex",
++      modelProvider: "openai",
++    }),
++    resolveConversationAppServerRuntime: async () => ({
++      runtime: testState.runtime,
++      workspaceDir: "/synthetic/workspace",
++      planMode: testState.planMode,
++    }),
++    resolveModelBackedReviewerPolicyProvider: () => "openai",
++  };
++});
++vi.mock("./conversation-control.js", () => ({
++  buildCodexConversationAgentLookup: () => ({}),
++  resolveThreadRequestModelProvider: () => "openai",
++  trackCodexConversationActiveTurn: () => () => undefined,
++}));
++vi.mock("./conversation-turn-input.js", () => ({
++  buildCodexConversationTurnInput: () => [{ type: "text", text: "Synthetic Plan request" }],
++}));
++
++import { threadStartResult, turnStartResult } from "./app-server/codex-app-server.test-fixtures.js";
++import { sessionBindingIdentity } from "./app-server/session-binding.js";
++import { resolveCodexConversationPlanModeSettings } from "./conversation-binding-preparation.js";
++import { runBoundTurnWithMissingThreadRecovery } from "./conversation-binding.js";
++
++const nativeSettings: CodexNativeCollaborationMode = {
++  mode: "default",
++  settings: {
++    model: "gpt-5.4-codex",
++    reasoning_effort: "high",
++    developer_instructions: "Preserve the imported Codex instructions exactly.",
++  },
++};
++
++function createBindingStore() {
++  return {
++    read: () => testState.binding,
++    mutate: async (_identity: unknown, mutation: Record<string, unknown>) => {
++      if (mutation.kind === "set") {
++        testState.binding = mutation.binding as Record<string, unknown>;
++      } else if (mutation.kind === "patch") {
++        testState.binding = { ...testState.binding, ...(mutation.patch as object) };
++      }
++      return true;
++    },
++    withLease: async (_identity: unknown, run: () => Promise<unknown>) => await run(),
++    hasOtherThreadOwner: async () => false,
++  };
++}
++
++function setupScenario(
++  options: { rotateNetworkProfile?: boolean; settings?: unknown; planMode?: boolean } = {},
++) {
++  const oldThreadId = "thread-before-plan";
++  const newThreadId = "thread-after-rotation";
++  const previousClientId = "codex-previous-client";
++  const currentClientId = options.rotateNetworkProfile ? "codex-rotated-client" : previousClientId;
++  testState.clientId = currentClientId;
++  testState.planMode = options.planMode ?? true;
++  testState.nativeSettings = options.settings ?? nativeSettings;
++  testState.nativeByThread.clear();
++  testState.requests = [];
++  testState.notificationHandlers.clear();
++  testState.turnParams = undefined;
++  testState.closedClients = [];
++  testState.releasedBindings = [];
++  testState.siblingClientThreads = new Set([oldThreadId, "thread-owned-by-sibling"]);
++  testState.startedThreadId = newThreadId;
++  testState.runtime = {
++    requestTimeoutMs: 1_000,
++    start: { transport: "stdio" },
++    approvalPolicy: "never",
++    approvalsReviewer: "user",
++    sandbox: "workspace-write",
++    ...(options.rotateNetworkProfile
++      ? {
++          networkProxy: {
++            profileName: "new-profile",
++            configFingerprint: "new-profile-fingerprint",
++          },
++        }
++      : {}),
++  };
++  testState.binding = {
++    threadId: oldThreadId,
++    clientId: options.rotateNetworkProfile ? previousClientId : currentClientId,
++    cwd: "/synthetic/workspace",
++    model: "gpt-5.4-codex",
++    modelProvider: "openai",
++    ...(options.rotateNetworkProfile
++      ? {
++          networkProxyProfileName: "old-profile",
++          networkProxyConfigFingerprint: "old-profile-fingerprint",
++        }
++      : {}),
++  };
++  testState.client = {
++    getInstanceId: () => currentClientId,
++    request: async (method: string, params?: Record<string, unknown>) => {
++      testState.requests.push({ method, params });
++      if (method === "config/read") {
++        return { config: {}, origins: {}, layers: [] };
++      }
++      if (method === "thread/read") {
++        const threadId = typeof params?.threadId === "string" ? params.threadId : oldThreadId;
++        return { thread: { ...threadStartResult(threadId).thread, canAcceptDirectInput: true } };
++      }
++      if (method === "thread/start") {
++        return {
++          ...threadStartResult(newThreadId),
++          model: "gpt-5.4-codex",
++          reasoningEffort: "high",
++        };
++      }
++      if (method === "thread/settings/update") {
++        const threadId = params?.threadId;
++        if (typeof threadId !== "string") {
++          throw new Error("thread/settings/update requires a threadId");
++        }
++        const collaborationMode = params?.collaborationMode;
++        return new Promise((resolve) => {
++          queueMicrotask(() => {
++            resolve({});
++            queueMicrotask(() => {
++              testState.nativeByThread.set(threadId, collaborationMode);
++              const notification = {
++                method: "thread/settings/updated",
++                params: { threadId, threadSettings: { collaborationMode } },
++              };
++              for (const handler of testState.notificationHandlers) {
++                handler(notification);
++              }
++            });
++          });
++        });
++      }
++      if (method === "thread/resume") {
++        return {
++          ...threadStartResult(
++            typeof params?.threadId === "string" ? params.threadId : oldThreadId,
++          ),
++          collaborationMode: testState.nativeSettings,
++        };
++      }
++      if (method === "turn/start") {
++        testState.turnParams = params;
++        return turnStartResult("turn-plan");
++      }
++      if (method === "thread/unsubscribe") {
++        return {};
++      }
++      throw new Error(`Unexpected app-server request: ${method}`);
++    },
++    addNotificationHandler: (handler: (notification: unknown) => void) => {
++      testState.notificationHandlers.add(handler);
++      return () => {
++        testState.notificationHandlers.delete(handler);
++      };
++    },
++    addRequestHandler: () => () => undefined,
++    addCloseHandler: () => () => undefined,
++    close: vi.fn(),
++  };
++  return { oldThreadId, newThreadId, previousClientId, bindingStore: createBindingStore() };
++}
++
++function createTurnParams(bindingStore: ReturnType<typeof createBindingStore>) {
++  const sourceIdentity = sessionBindingIdentity({
++    agentId: "main",
++    sessionId: "session-plan-test",
++    sessionKey: "agent:main:session-plan-test",
++  });
++  return {
++    bindingStore,
++    data: {
++      bindingId: "conversation-plan-test",
++      agentId: "main",
++      agentDir: "/synthetic/agent",
++      workspaceDir: "/synthetic/workspace",
++      source: { ...sourceIdentity, threadId: "thread-source" },
++    },
++    prompt: "Read only while planning.",
++    event: {},
++    incognito: false,
++    timeoutMs: 1_000,
++  };
++}
++
++describe("conversation-bound native Plan mode", () => {
++  beforeEach(() => {
++    setupScenario();
++  });
++
++  afterEach(() => vi.unstubAllEnvs());
++
++  it("keeps an absent source mode unknown", () => {
++    expect(
++      resolveCodexConversationPlanModeSettings({
++        planMode: undefined,
++        nativeSettings: undefined,
++      }),
++    ).toBeUndefined();
++  });
++
++  it("preserves same-mode settings and resets instructions when changing native modes", () => {
++    expect(
++      resolveCodexConversationPlanModeSettings({
++        planMode: true,
++        nativeSettings,
++        selectedModel: "gpt-5.4-codex",
++      }),
++    ).toEqual({
++      mode: "plan",
++      settings: {
++        ...nativeSettings.settings,
++        developer_instructions: null,
++      },
++    });
++    expect(
++      resolveCodexConversationPlanModeSettings({
++        planMode: false,
++        nativeSettings: { ...nativeSettings, mode: "plan" },
++        selectedModel: "gpt-5.4-codex",
++      }),
++    ).toEqual({
++      mode: "default",
++      settings: {
++        ...nativeSettings.settings,
++        developer_instructions: null,
++      },
++    });
++  });
++
++  it("fails closed when a full snapshot or matching native model is unavailable", () => {
++    expect(() =>
++      resolveCodexConversationPlanModeSettings({
++        planMode: true,
++        nativeSettings: undefined,
++      }),
++    ).toThrow("complete thread settings snapshot");
++    expect(() =>
++      resolveCodexConversationPlanModeSettings({
++        planMode: true,
++        nativeSettings,
++        selectedModel: "different-model",
++      }),
++    ).toThrow("selected model differs from the native thread model");
++  });
++
++  it("uses actual start settings and waits for native Plan readback before the first turn", async () => {
++    const { newThreadId, bindingStore } = setupScenario({ rotateNetworkProfile: true });
++
++    await expect(
++      runBoundTurnWithMissingThreadRecovery(createTurnParams(bindingStore) as never),
++    ).resolves.toMatchObject({ reply: { text: "Plan turn completed" } });
++
++    expect(testState.requests.map(({ method }) => method)).toEqual([
++      "thread/start",
++      "thread/settings/update",
++      "turn/start",
++    ]);
++    const expectedSettings = {
++      mode: "plan",
++      settings: {
++        model: "gpt-5.4-codex",
++        reasoning_effort: "high",
++        developer_instructions: null,
++      },
++    };
++    expect(testState.requests[1]?.params).toEqual({
++      threadId: newThreadId,
++      collaborationMode: expectedSettings,
++    });
++    expect(testState.nativeByThread.get(newThreadId)).toEqual(expectedSettings);
++    expect(testState.turnParams?.collaborationMode).toEqual(expectedSettings);
++  });
++
++  it("initializes an OpenClaw-created bound thread from the captured Plan state", async () => {
++    const { newThreadId, bindingStore } = setupScenario();
++    testState.binding = undefined;
++    const sourceIdentity = sessionBindingIdentity({
++      agentId: "main",
++      sessionId: "session-plan-test",
++      sessionKey: "agent:main:session-plan-test",
++    });
++    const stateDir = sessionDirs.make();
++    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
++    await upsertSessionEntry({
++      agentId: sourceIdentity.agentId,
++      sessionKey: sourceIdentity.sessionKey!,
++      storePath: resolveStorePath(undefined, { agentId: sourceIdentity.agentId }),
++      entry: { sessionId: sourceIdentity.sessionId, updatedAt: 1, planMode: true },
++    });
++
++    await expect(
++      runBoundTurnWithMissingThreadRecovery(createTurnParams(bindingStore) as never),
++    ).resolves.toMatchObject({ reply: { text: "Plan turn completed" } });
++
++    expect(testState.requests.map(({ method }) => method)).toEqual([
++      "config/read",
++      "thread/start",
++      "thread/settings/update",
++      "turn/start",
++    ]);
++    expect(
++      testState.requests.find(({ method }) => method === "thread/settings/update")?.params,
++    ).toMatchObject({
++      threadId: newThreadId,
++      collaborationMode: {
++        mode: "plan",
++        settings: {
++          model: "gpt-5.4-codex",
++          reasoning_effort: "high",
++          developer_instructions: null,
++        },
++      },
++    });
++    expect(testState.binding).toMatchObject({ threadId: newThreadId });
++    expect(testState.turnParams?.collaborationMode).toMatchObject({ mode: "plan" });
++  });
++
++  it("does not initialize native mode when the source mode is absent", async () => {
++    const { newThreadId, bindingStore } = setupScenario({ rotateNetworkProfile: true });
++    testState.planMode = undefined;
++
++    await expect(
++      runBoundTurnWithMissingThreadRecovery(createTurnParams(bindingStore) as never),
++    ).resolves.toMatchObject({ reply: { text: "Plan turn completed" } });
++
++    expect(testState.requests.map(({ method }) => method)).toEqual(["thread/start", "turn/start"]);
++    expect(testState.nativeByThread.has(newThreadId)).toBe(false);
++    expect(testState.turnParams?.collaborationMode).toBeUndefined();
++  });
++
++  it("initializes explicit Default after network rotation without disturbing a sibling thread", async () => {
++    const { oldThreadId, newThreadId, previousClientId, bindingStore } = setupScenario({
++      rotateNetworkProfile: true,
++      planMode: false,
++    });
++
++    await expect(
++      runBoundTurnWithMissingThreadRecovery(createTurnParams(bindingStore) as never),
++    ).resolves.toMatchObject({ reply: { text: "Plan turn completed" } });
++
++    expect(testState.requests.map(({ method }) => method)).toEqual([
++      "thread/start",
++      "thread/settings/update",
++      "turn/start",
++    ]);
++    expect(testState.requests[1]?.params).toEqual({
++      threadId: newThreadId,
++      collaborationMode: {
++        mode: "default",
++        settings: {
++          model: "gpt-5.4-codex",
++          reasoning_effort: "high",
++          developer_instructions: null,
++        },
++      },
++    });
++    expect(testState.turnParams?.collaborationMode).toEqual({
++      mode: "default",
++      settings: {
++        model: "gpt-5.4-codex",
++        reasoning_effort: "high",
++        developer_instructions: null,
++      },
++    });
++    expect(testState.releasedBindings).toHaveLength(1);
++    expect(testState.releasedBindings[0]).toMatchObject({
++      clientId: previousClientId,
++      threadId: oldThreadId,
++    });
++    expect(testState.siblingClientThreads).toEqual(new Set(["thread-owned-by-sibling"]));
++    expect(testState.closedClients).toEqual([]);
++  });
++
++  it("refuses Plan when resume returns an incomplete native settings snapshot", async () => {
++    const { bindingStore } = setupScenario({
++      settings: {
++        mode: "default",
++        settings: { model: "gpt-5.4-codex", reasoning_effort: "high" },
++      },
++    });
++
++    await expect(
++      runBoundTurnWithMissingThreadRecovery(createTurnParams(bindingStore) as never),
++    ).rejects.toThrow("complete thread settings snapshot");
++    expect(testState.requests.map(({ method }) => method)).toEqual([
++      "thread/read",
++      "thread/resume",
++    ]);
++    expect(testState.closedClients).toEqual([]);
++  });
++});
+diff --git a/extensions/codex/src/conversation-binding-preparation-plan-mode.test.ts b/extensions/codex/src/conversation-binding-preparation-plan-mode.test.ts
+new file mode 100644
+index 00000000000..96c6b348ed0
+--- /dev/null
++++ b/extensions/codex/src/conversation-binding-preparation-plan-mode.test.ts
+@@ -0,0 +1,78 @@
++import { resolveStorePath, upsertSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
++import { useSessionStoreTempDirs } from "openclaw/plugin-sdk/sqlite-runtime-testing";
++import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import {
++  assertNativeConversationApprovalPolicySupported,
++  resolveConversationAppServerRuntime,
++  type CodexConversationConfig,
++} from "./conversation-binding-preparation.js";
++
++const sessionDirs = useSessionStoreTempDirs(afterAll, "openclaw-codex-plan-binding-");
++
++describe("bound conversation Plan launch policy", () => {
++  let stateDir: string;
++  let workspaceDir: string;
++
++  beforeEach(() => {
++    stateDir = sessionDirs.make();
++    workspaceDir = `${stateDir}/workspace`;
++    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
++  });
++
++  afterEach(() => vi.unstubAllEnvs());
++
++  async function prepare(options: { permissionMode?: "full" | "read-only"; execMode?: "deny" }) {
++    const agentId = "main";
++    const sessionId = "plan-bound-session";
++    const sessionKey = "agent:main:plan-bound-session";
++    const storePath = resolveStorePath(undefined, { agentId });
++    await upsertSessionEntry({
++      agentId,
++      sessionKey,
++      storePath,
++      entry: {
++        sessionId,
++        updatedAt: 1,
++        planMode: true,
++        ...(options.permissionMode ? { permissionMode: options.permissionMode } : {}),
++        sessionRoot: workspaceDir,
++      },
++    });
++    const config = {
++      agents: { defaults: { workspace: workspaceDir }, entries: { main: {} } },
++      ...(options.execMode ? { tools: { exec: { mode: options.execMode } } } : {}),
++    } as CodexConversationConfig;
++    return await resolveConversationAppServerRuntime({
++      config,
++      source: { agentId, sessionId, sessionKey, threadId: "thread-source" },
++      workspaceDir,
++      agentDir: `${stateDir}/agent`,
++      modelProvider: "openai",
++      model: "gpt-5.5",
++    });
++  }
++
++  it("uses an actual read-only native sandbox for a bound Plan session with saved full access", async () => {
++    const prepared = await prepare({ permissionMode: "full" });
++    expect(prepared.planMode).toBe(true);
++    expect(prepared.runtime).toMatchObject({
++      sandbox: "read-only",
++      approvalPolicy: "never",
++    });
++  });
++
++  it("keeps configured exec denial authoritative when the saved permission is unset", async () => {
++    await expect(prepare({ execMode: "deny" })).rejects.toThrow("effective tools.exec.mode=deny");
++  });
++
++  it("keeps saved read-only authority behind the unsupported approval guard", async () => {
++    const prepared = await prepare({ permissionMode: "read-only" });
++    expect(prepared.runtime).toMatchObject({
++      sandbox: "read-only",
++      approvalPolicy: "on-request",
++    });
++    expect(() => assertNativeConversationApprovalPolicySupported(prepared.runtime)).toThrow(
++      "cannot route interactive approvals yet",
++    );
++  });
++});
+diff --git a/src/agents/embedded-agent-runner/run/run-attempt-plan-mode.test.ts b/src/agents/embedded-agent-runner/run/run-attempt-plan-mode.test.ts
+new file mode 100644
+index 00000000000..6f202fb6095
+--- /dev/null
++++ b/src/agents/embedded-agent-runner/run/run-attempt-plan-mode.test.ts
+@@ -0,0 +1,186 @@
++import fs from "node:fs/promises";
++import os from "node:os";
++import path from "node:path";
++import { afterEach, expect, it, vi } from "vitest";
++import { withOpenClawTestState } from "../../../test-utils/openclaw-test-state.js";
++
++const captured = vi.hoisted(() => ({
++  attemptParams: undefined as unknown,
++  backendFailure: new Error("stop after capturing attempt parameters"),
++}));
++
++vi.mock("./backend.js", () => ({
++  runEmbeddedAttemptWithBackend: vi.fn(async (params: unknown) => {
++    captured.attemptParams = params;
++    throw captured.backendFailure;
++  }),
++}));
++vi.mock("./attempt-gateway-tools.js", () => ({
++  withPreparedEmbeddedGatewayTools: async (
++    _params: unknown,
++    _isCurrent: unknown,
++    run: () => Promise<unknown>,
++  ) => run(),
++}));
++vi.mock("../../admitted-run-context.js", () => ({
++  resolveAdmittedRunActiveAssertion: () => () => undefined,
++}));
++vi.mock("../../model-routing-decision.js", () => ({
++  recordAdmittedModelRoutingDecision: vi.fn(),
++}));
++vi.mock("../../plugin-runtime-refresh.js", () => ({
++  captureAgentPluginRuntimeRefresh: () => ({ isPending: false, bindConsumer: vi.fn() }),
++}));
++vi.mock("../../runtime-plan/build.js", () => ({ buildAgentRuntimePlan: () => ({}) }));
++vi.mock("../../tool-terminal-outcome.js", () => ({
++  createToolTerminalObserver: () => vi.fn(),
++}));
++vi.mock("../../harness/tool-surface.js", () => ({ agentHarnessBuildsOpenClawTools: () => false }));
++vi.mock("../../model-auth.js", () => ({
++  applyAuthHeaderOverride: (model: unknown) => model,
++  applyLocalNoAuthHeaderOverride: (model: unknown) => model,
++}));
++vi.mock("../../../plugins/provider-hook-runtime.js", () => ({
++  attachModelProviderRuntimePluginHandle: (model: unknown) => model,
++}));
++vi.mock("../../workspace-sandbox.js", () => ({
++  resolveAttemptWorkspaceSandbox: vi.fn(),
++  resolveHarnessWorkspace: () => ({}),
++}));
++vi.mock("../../session-placement-skill-resources.js", () => ({
++  resolveSessionSkillResourceSnapshot: () => undefined,
++}));
++vi.mock("../../reply-completion.js", () => ({ resolveReplyExpectation: () => undefined }));
++vi.mock("./attempt-exec-approval-continuation.js", () => ({
++  prepareExecApprovalContinuationForAttempt: ({ prompt }: { prompt: string }) => ({ prompt }),
++}));
++vi.mock("./attempt-memory-audience.js", () => ({
++  resolveEmbeddedAttemptMemoryAudience: async () => ({
++    memoryAudience: undefined,
++    release: vi.fn(),
++  }),
++}));
++vi.mock("./attempt-system-prompt-additions.js", () => ({
++  prepareAttemptSystemPromptAdditions: async () => ({
++    extraSystemPrompt: undefined,
++    gitCoauthorPrompt: undefined,
++  }),
++}));
++vi.mock("./auth-store.js", () => ({ resolveAttemptDispatchApiKey: () => undefined }));
++vi.mock("./helpers.js", () => ({
++  resolveEmbeddedAttemptBasePrompt: ({ prompt }: { prompt: string }) => prompt,
++}));
++
++import { prepareAndDispatchEmbeddedRunAttempt } from "./run-attempt-dispatch.js";
++
++afterEach(() => vi.restoreAllMocks());
++
++it("carries the captured Plan and unset permission sentinel into the real backend dispatch", async () => {
++  captured.attemptParams = undefined;
++  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-plan-dispatch-"));
++  const sessionId = "session-1";
++  const sessionKey = "agent:main:session-1";
++  const sessionFile = path.join(workspaceDir, "session.jsonl");
++  const model = {
++    id: "synthetic-model",
++    name: "Synthetic model",
++    provider: "synthetic",
++    api: "openai-responses",
++    input: ["text"],
++    contextWindow: 8192,
++    maxTokens: 1024,
++  };
++  const abortSignal = new AbortController().signal;
++  const input = {
++    runInput: {
++      runParams: {
++        admittedRunContext: {},
++        config: {},
++        agentId: "main",
++        prompt: "Prepare a plan",
++        runId: "synthetic-run",
++        sessionId,
++        sessionKey,
++        sessionFile,
++        planMode: true,
++        storedPermissionMode: null,
++        permissionMode: "read-only",
++      },
++      progressController: {
++        maybeAnnounceFastModeAutoOff: vi.fn(),
++        notifyExecutionPhase: vi.fn(),
++        notifyRunProgress: vi.fn(),
++        resolveAttemptFastModeParam: () => undefined,
++      },
++      laneController: {
++        createAttemptControls: () => ({
++          abortSignal,
++          isCurrent: () => true,
++          onAttemptDeadlineChanged: vi.fn(),
++          onAttemptTimeout: vi.fn(),
++          onAttemptAbort: vi.fn(),
++          close: vi.fn(),
++        }),
++      },
++      workspaceResolution: { agentId: "main" },
++      workspaceDir,
++      agentDir: path.join(workspaceDir, "agent"),
++      isCanonicalWorkspace: true,
++      resolvedSessionKey: sessionKey,
++      resolvedToolResultFormat: "markdown",
++      startupStages: { mark: vi.fn() },
++      emitStartupStageSummary: vi.fn(),
++      lifecycleGeneration: {},
++      startedAtMs: 1,
++    },
++    preparedRuntime: {
++      requestedModelId: "synthetic-model",
++      nativeModelOwned: false,
++      attemptAuthProfileStore: undefined,
++      lockedProfileId: undefined,
++      resolveRunAttemptAuthProfileStore: () => undefined,
++      snapshot: () => ({
++        effectiveModel: model,
++        agentHarness: { id: "synthetic" },
++        pluginHarnessOwnsTransport: false,
++        thinkLevel: "off",
++        runtimeAuthState: null,
++      }),
++    },
++    sessionPromptState: {
++      activePrompt: { internal: false, persisted: false },
++      sessionId,
++      sessionFile,
++      sessionTarget: { agentId: "main", sessionId, sessionKey },
++      settleOwnedTranscriptProjection: async () => undefined,
++    },
++    terminalRetryState: { beforeFinalizeRevisionAttempts: 0 },
++    replayState: {},
++    provider: "synthetic",
++    modelId: "synthetic-model",
++    startupStagesEmitted: true,
++    bootstrapPromptWarningSignaturesSeen: [],
++    resolveRuntimeFallbackReason: () => null,
++    observeToolOutcome: vi.fn(),
++    isTurnTainted: () => false,
++    allocateToolOutcomeOrdinal: () => 1,
++    getPostCompactionAbortError: () => undefined,
++    setPostCompactionAbortController: vi.fn(),
++    clearPostCompactionAbortController: vi.fn(),
++  } as unknown as Parameters<typeof prepareAndDispatchEmbeddedRunAttempt>[0];
++
++  try {
++    await withOpenClawTestState({ label: "plan-dispatch" }, async () => {
++      await expect(prepareAndDispatchEmbeddedRunAttempt(input)).rejects.toBe(
++        captured.backendFailure,
++      );
++      expect(captured.attemptParams).toMatchObject({
++        planMode: true,
++        storedPermissionMode: null,
++        permissionMode: "read-only",
++      });
++    });
++  } finally {
++    await fs.rm(workspaceDir, { recursive: true, force: true });
++  }
++});
+diff --git a/src/agents/session-plan-mode.test.ts b/src/agents/session-plan-mode.test.ts
+new file mode 100644
+index 00000000000..e2233a2ddf4
+--- /dev/null
++++ b/src/agents/session-plan-mode.test.ts
+@@ -0,0 +1,94 @@
++import { describe, expect, it } from "vitest";
++import { projectEffectiveExecPolicy } from "./session-permission-exec-mode.js";
++import {
++  buildSessionPlanModePrompt,
++  resolveSessionPlanModeAttemptFields,
++  resolveCoreSessionPlanModeLaunchPermissionMode,
++  resolveCoreSessionPlanModePermissionMode,
++} from "./session-plan-mode.js";
++
++describe("session Plan mode", () => {
++  it.each([
++    { planMode: true, permissionMode: "full" as const, expected: "read-only" as const },
++    { planMode: true, permissionMode: "workspace" as const, expected: "read-only" as const },
++    { planMode: true, permissionMode: undefined, expected: "read-only" as const },
++    { planMode: false, permissionMode: "full" as const, expected: "full" as const },
++    { planMode: undefined, permissionMode: "guarded" as const, expected: "guarded" as const },
++    { planMode: false, permissionMode: undefined, expected: undefined },
++  ])(
++    "derives effective permissions without changing saved settings: $planMode/$permissionMode",
++    (testCase) => {
++      expect(
++        resolveCoreSessionPlanModePermissionMode({
++          planMode: testCase.planMode,
++          permissionMode: testCase.permissionMode,
++        }),
++      ).toBe(testCase.expected);
++    },
++  );
++
++  it("keeps the Plan clamp after a permission refresh requests broader access", () => {
++    const permissionMode = resolveCoreSessionPlanModePermissionMode({
++      planMode: true,
++      permissionMode: "full",
++    });
++    expect(permissionMode).toBe("read-only");
++    expect(
++      projectEffectiveExecPolicy({
++        base: { mode: "full", security: "full", ask: "off" },
++        overrides: { mode: "full", security: "full", ask: "off" },
++        permissionPolicy: { mode: "read-only" },
++      }),
++    ).toMatchObject({ mode: "deny", security: "deny", ask: "off" });
++  });
++
++  it("uses only a captured saved mode for launch and distinguishes an unset mode from a missing snapshot", () => {
++    expect(
++      resolveCoreSessionPlanModeLaunchPermissionMode({
++        planMode: true,
++        storedPermissionMode: "full",
++        effectivePermissionMode: "read-only",
++      }),
++    ).toBe("full");
++    expect(
++      resolveCoreSessionPlanModeLaunchPermissionMode({
++        planMode: true,
++        storedPermissionMode: null,
++        effectivePermissionMode: "read-only",
++      }),
++    ).toBeUndefined();
++    expect(() =>
++      resolveCoreSessionPlanModeLaunchPermissionMode({
++        planMode: true,
++        storedPermissionMode: undefined,
++        effectivePermissionMode: "read-only",
++      }),
++    ).toThrow("captured session permission snapshot");
++  });
++
++  it("carries the captured Plan and unset sentinel through attempt dispatch serialization", () => {
++    const fields = resolveSessionPlanModeAttemptFields({
++      planMode: true,
++      storedPermissionMode: null,
++    });
++    expect(fields).toEqual({ planMode: true, storedPermissionMode: null });
++    expect(structuredClone(fields)).toEqual({
++      planMode: true,
++      storedPermissionMode: null,
++    });
++    expect(
++      structuredClone(
++        resolveSessionPlanModeAttemptFields({
++          planMode: true,
++          storedPermissionMode: undefined,
++        }),
++      ),
++    ).toEqual({ planMode: true });
++  });
++
++  it("adds planning instructions only while Plan mode is active", () => {
++    expect(buildSessionPlanModePrompt(true)).toContain("host enforces read-only permissions");
++    expect(buildSessionPlanModePrompt(false)).toBeUndefined();
++    expect(buildSessionPlanModePrompt(undefined)).toBeUndefined();
++  });
++});
+diff --git a/src/agents/session-plan-mode.ts b/src/agents/session-plan-mode.ts
+new file mode 100644
+index 00000000000..876b19cfcaa
+--- /dev/null
++++ b/src/agents/session-plan-mode.ts
+@@ -0,0 +1,47 @@
++import type { SessionEntry } from "../config/sessions/types.js";
++
++const SESSION_PLAN_MODE_SYSTEM_PROMPT = [
++  "Plan mode is active for this session.",
++  "Use available read-only information to prepare a concrete plan, then return the plan and wait for a separate request before making changes.",
++  "The host enforces read-only permissions for this run; do not treat the session's saved permissions as available authority.",
++].join("\n\n");
++
++export function resolveCoreSessionPlanModePermissionMode(params: {
++  planMode: boolean | undefined;
++  permissionMode: SessionEntry["permissionMode"] | null | undefined;
++}): SessionEntry["permissionMode"] | undefined {
++  if (params.planMode === true) {
++    return "read-only";
++  }
++  return params.permissionMode ?? undefined;
++}
++
++/** Resolve native launch authority without treating Plan's effective clamp as saved authority. */
++export function resolveCoreSessionPlanModeLaunchPermissionMode(params: {
++  planMode: boolean | undefined;
++  storedPermissionMode: SessionEntry["permissionMode"] | null | undefined;
++  effectivePermissionMode: SessionEntry["permissionMode"] | undefined;
++}): SessionEntry["permissionMode"] | undefined {
++  if (params.planMode !== true) {
++    return params.effectivePermissionMode;
++  }
++  if (params.storedPermissionMode === undefined) {
++    throw new Error("Plan mode requires a captured session permission snapshot.");
++  }
++  return params.storedPermissionMode ?? undefined;
++}
++
++/** Preserve the captured source mode across the real harness dispatch boundary. */
++export function resolveSessionPlanModeAttemptFields(params: {
++  planMode?: boolean;
++  storedPermissionMode?: SessionEntry["permissionMode"] | null;
++}) {
++  return {
++    planMode: params.planMode,
++    storedPermissionMode: params.storedPermissionMode,
++  };
++}
++
++export function buildSessionPlanModePrompt(planMode: boolean | undefined): string | undefined {
++  return planMode === true ? SESSION_PLAN_MODE_SYSTEM_PROMPT : undefined;
++}
+diff --git a/ui/src/app/native-window-focus.test.ts b/ui/src/app/native-window-focus.test.ts
+new file mode 100644
+index 00000000000..f1ae013e9eb
+--- /dev/null
++++ b/ui/src/app/native-window-focus.test.ts
+@@ -0,0 +1,104 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { focusControlUiWindow, openControlUiExternalLink } from "./native-window-focus.ts";
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++  vi.restoreAllMocks();
++});
++
++describe("Control UI window focus", () => {
++  it("reports the browser's actual focus result when no native bridge is present", async () => {
++    const focus = vi.spyOn(window, "focus").mockImplementation(() => {});
++    vi.spyOn(document, "hasFocus").mockReturnValue(false);
++    expect(await focusControlUiWindow(new AbortController().signal)).toBe(false);
++    expect(focus).toHaveBeenCalledOnce();
++  });
++
++  it("uses the native acknowledgement instead of assuming a requested focus succeeded", async () => {
++    const postMessage = vi
++      .fn()
++      .mockResolvedValueOnce({ focused: false })
++      .mockResolvedValueOnce({ focused: true });
++    vi.stubGlobal("webkit", { messageHandlers: { openclawWindowFocus: { postMessage } } });
++    expect(await focusControlUiWindow(new AbortController().signal)).toBe(false);
++    expect(await focusControlUiWindow(new AbortController().signal)).toBe(true);
++    expect(postMessage.mock.calls).toEqual([
++      [{ type: "focus-window" }],
++      [{ type: "focus-window" }],
++    ]);
++  });
++
++  it("does not accept an acknowledgement after its caller has ended", async () => {
++    const pending = Promise.withResolvers<unknown>();
++    vi.stubGlobal("webkit", {
++      messageHandlers: { openclawWindowFocus: { postMessage: () => pending.promise } },
++    });
++    const lifetime = new AbortController();
++    const result = focusControlUiWindow(lifetime.signal);
++    lifetime.abort();
++    pending.resolve({ focused: true });
++    await expect(result).rejects.toThrow();
++  });
++
++  it("rejects a response from a replaced native bridge", async () => {
++    const pending = Promise.withResolvers<unknown>();
++    const handlers = { openclawWindowFocus: { postMessage: () => pending.promise } };
++    vi.stubGlobal("webkit", { messageHandlers: handlers });
++    const result = focusControlUiWindow(new AbortController().signal);
++    handlers.openclawWindowFocus = { postMessage: async () => ({ focused: true }) };
++    pending.resolve({ focused: true });
++    await expect(result).rejects.toThrow("connection changed");
++  });
++});
++
++describe("Control UI external links", () => {
++  it("rejects executable schemes and embedded credentials before opening anything", async () => {
++    const open = vi.spyOn(window, "open").mockReturnValue(null);
++    for (const url of [
++      "javascript:alert(1)",
++      "file:///tmp/test",
++      "https://user:secret@example.test",
++    ]) {
++      await expect(openControlUiExternalLink(url, new AbortController().signal)).rejects.toThrow();
++    }
++    expect(open).not.toHaveBeenCalled();
++  });
++
++  it("reports popup refusal and detaches the opener before navigating an admitted window", async () => {
++    const opened = { opener: window, location: { replace: vi.fn() } };
++    const open = vi
++      .spyOn(window, "open")
++      .mockReturnValueOnce(null)
++      .mockReturnValueOnce(opened as unknown as Window);
++    expect(
++      await openControlUiExternalLink("https://example.test/", new AbortController().signal),
++    ).toBe(false);
++    opened.location.replace.mockImplementation(() => {
++      expect(opened.opener).toBeNull();
++    });
++    expect(
++      await openControlUiExternalLink("https://example.test/", new AbortController().signal),
++    ).toBe(true);
++    expect(opened.location.replace).toHaveBeenCalledWith("https://example.test/");
++    expect(open).toHaveBeenCalledTimes(2);
++  });
++
++  it("uses the current native link owner and rejects a retired caller", async () => {
++    const postMessage = vi.fn();
++    vi.stubGlobal("webkit", { messageHandlers: { openclawLink: { postMessage } } });
++    expect(
++      await openControlUiExternalLink("https://example.test/", new AbortController().signal),
++    ).toBe(true);
++    expect(postMessage).toHaveBeenCalledWith({
++      type: "open-link",
++      url: "https://example.test/",
++      target: "external",
++    });
++    const ended = new AbortController();
++    ended.abort();
++    await expect(
++      openControlUiExternalLink("https://example.test/", ended.signal),
++    ).rejects.toThrow();
++    expect(postMessage).toHaveBeenCalledOnce();
++  });
++});
+diff --git a/ui/src/app/native-window-focus.ts b/ui/src/app/native-window-focus.ts
+new file mode 100644
+index 00000000000..8d10400e8de
+--- /dev/null
++++ b/ui/src/app/native-window-focus.ts
+@@ -0,0 +1,49 @@
++import { reserveExternalWindowForDeferredNavigation } from "../lib/open-external-url.ts";
++import { postNativeExternalLink } from "./native-link-routing.ts";
++import { webKitHostWindow } from "./native-webkit-bridge.ts";
++
++type WindowFocusHandler = { postMessage: (request: { type: "focus-window" }) => Promise<unknown> };
++
++/** Focus this dashboard only; regular browsers retain their own focus policy. */
++export async function focusControlUiWindow(signal: AbortSignal): Promise<boolean> {
++  signal.throwIfAborted();
++  // SAFETY: The macOS dashboard registers this reply-capable handler on its trusted WKWebView; the reply is validated below.
++  const nativeWindow = window as Window & {
++    webkit?: { messageHandlers?: { openclawWindowFocus?: WindowFocusHandler } };
++  };
++  const handler = nativeWindow.webkit?.messageHandlers?.openclawWindowFocus;
++  if (typeof handler?.postMessage !== "function") {
++    window.focus();
++    return document.hasFocus();
++  }
++  const sendFocusRequest = handler.postMessage.bind(handler);
++  const reply = await sendFocusRequest({ type: "focus-window" });
++  signal.throwIfAborted();
++  if (nativeWindow.webkit?.messageHandlers?.openclawWindowFocus !== handler) {
++    throw new Error("The native window connection changed. Use its current Control UI.");
++  }
++  return (
++    typeof reply === "object" && reply !== null && "focused" in reply && reply.focused === true
++  );
++}
++
++/** Reuse the native link policy and the browser's detached window navigation. */
++export async function openControlUiExternalLink(
++  rawUrl: string,
++  signal: AbortSignal,
++): Promise<boolean> {
++  signal.throwIfAborted();
++  const url = new URL(rawUrl);
++  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
++    throw new Error("External links require an HTTP or HTTPS URL without embedded credentials.");
++  }
++  if (webKitHostWindow()?.webkit?.messageHandlers?.openclawLink) {
++    return postNativeExternalLink(url.href);
++  }
++  const opened = reserveExternalWindowForDeferredNavigation();
++  if (!opened) {
++    return false;
++  }
++  opened.location.replace(url.href);
++  return true;
++}
+diff --git a/ui/src/pages/chat/chat-plugin-dictation.test.ts b/ui/src/pages/chat/chat-plugin-dictation.test.ts
+new file mode 100644
+index 00000000000..0c219fa6753
+--- /dev/null
++++ b/ui/src/pages/chat/chat-plugin-dictation.test.ts
+@@ -0,0 +1,108 @@
++/* @vitest-environment jsdom */
++
++import { render } from "lit";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { createComposerProps } from "./chat-composer.test-support.ts";
++import { getChatComposerState } from "./components/chat-composer-state.ts";
++import { renderChatComposer, resetChatComposerState } from "./components/chat-composer.ts";
++
++type NativeDictationControls = {
++  start: () => boolean;
++  finish: () => Promise<boolean>;
++};
++
++afterEach(() => {
++  resetChatComposerState();
++  document.body.replaceChildren();
++  vi.restoreAllMocks();
++});
++
++describe("native composer dictation hooks", () => {
++  it("starts and finishes native dictation without invoking Talk or Send", async () => {
++    const paneId = "native-dictation";
++    const onToggleRealtimeTalk = vi.fn();
++    const onSend = vi.fn();
++    const container = document.createElement("div");
++    let controls: NativeDictationControls | null = null;
++    render(
++      renderChatComposer(
++        createComposerProps({
++          paneId,
++          sessionKey: "agent:main:session-a",
++          draft: "keep this draft",
++          onSend,
++          onToggleRealtimeTalk,
++        }),
++        (next) => {
++          controls = next;
++        },
++      ),
++      container,
++    );
++
++    const state = getChatComposerState(paneId);
++    const controller = state.dictation;
++    const textarea = container.querySelector<HTMLTextAreaElement>("textarea");
++    expect(controller).not.toBeNull();
++    expect(textarea).not.toBeNull();
++    if (!controller || !textarea || !controls) {
++      throw new Error("native dictation hooks were not captured");
++    }
++    textarea.setSelectionRange(5, 9);
++    const startDirect = vi.spyOn(controller, "startDirect").mockReturnValue(true);
++    const finishActive = vi.spyOn(controller, "finishActive").mockResolvedValue(true);
++
++    expect(controls.start()).toBe(true);
++    expect(startDirect).toHaveBeenCalledOnce();
++    expect(state.dictationSelection).toEqual({ start: 5, end: 9, value: "keep this draft" });
++    expect(textarea.readOnly).toBe(true);
++    await expect(controls.finish()).resolves.toBe(true);
++    expect(finishActive).toHaveBeenCalledOnce();
++    expect(onToggleRealtimeTalk).not.toHaveBeenCalled();
++    expect(onSend).not.toHaveBeenCalled();
++  });
++
++  it("rejects callbacks captured for a composer after its session changes", async () => {
++    const paneId = "native-dictation-owner";
++    const container = document.createElement("div");
++    let oldControls: NativeDictationControls | null = null;
++    const draw = (sessionKey: string, capture: (value: NativeDictationControls | null) => void) =>
++      render(
++        renderChatComposer(
++          createComposerProps({ paneId, sessionKey, onToggleRealtimeTalk: vi.fn() }),
++          capture,
++        ),
++        container,
++      );
++    draw("agent:main:session-a", (next) => {
++      oldControls = next;
++    });
++    const oldController = getChatComposerState(paneId).dictation;
++    expect(oldController).not.toBeNull();
++    if (!oldController || !oldControls) {
++      throw new Error("initial native dictation hooks were not captured");
++    }
++    const oldStart = vi.spyOn(oldController, "startDirect").mockReturnValue(true);
++    const oldFinish = vi.spyOn(oldController, "finishActive").mockResolvedValue(true);
++    let currentControls: NativeDictationControls | null = null;
++    draw("agent:main:session-b", (next) => {
++      currentControls = next;
++    });
++    const currentController = getChatComposerState(paneId).dictation;
++    expect(currentController).not.toBeNull();
++    if (!currentController || !currentControls) {
++      throw new Error("replacement native dictation hooks were not captured");
++    }
++    const currentStart = vi.spyOn(currentController, "startDirect").mockReturnValue(true);
++    const currentFinish = vi.spyOn(currentController, "finishActive").mockResolvedValue(true);
++
++    expect(oldControls.start()).toBe(false);
++    await expect(oldControls.finish()).resolves.toBe(false);
++    expect(oldStart).not.toHaveBeenCalled();
++    expect(oldFinish).not.toHaveBeenCalled();
++    expect(currentStart).not.toHaveBeenCalled();
++    expect(currentFinish).not.toHaveBeenCalled();
++    expect(currentControls.start()).toBe(true);
++    expect(currentStart).toHaveBeenCalledOnce();
++  });
++});
